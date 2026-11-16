@@ -55,6 +55,9 @@ If you want to automatically declare unknown queues you can
 enable the `task_create_missing_queues` setting.
 """
 
+#: Pool class used when async concurrency is enabled for the prefork pool.
+ASYNC_POOL = 'celery.concurrency.aio:TaskPool'
+
 DESELECT_UNKNOWN_QUEUE = """
 Trying to deselect queue subset of {0!r}, but queue {1} isn't
 defined in the `task_queues` setting.
@@ -70,6 +73,12 @@ class WorkController:
     blueprint = None
     pool = None
     semaphore = None
+
+    #: Number of ``async def`` tasks the worker runs at the same time.
+    async_concurrency = 0
+
+    #: Number of child processes running ``async def`` tasks.
+    async_processes = 1
 
     #: (level, format, args) for a concurrency-resolution message produced in
     #: :meth:`setup_instance`, which runs before logging is configured (via
@@ -154,6 +163,8 @@ class WorkController:
         self.pool_cls = _concurrency.get_implementation(self.pool_cls)
         if is_auto_concurrency(self.concurrency):
             self._resolve_auto_concurrency()
+        if self.async_concurrency:
+            self._setup_async_concurrency(kwargs.get('autoscale'))
         self.steps = []
         self.on_init_blueprint()
         self.blueprint = self.Blueprint(
@@ -201,6 +212,30 @@ class WorkController:
                 "(pool=%s, %s, available cpus=%d).",
                 (self.concurrency, pool_name, quota, budget.available),
             )
+
+    def _setup_async_concurrency(self, autoscale=None):
+        # Selects the pool class running async tasks next to the sync ones.
+        from celery.concurrency.prefork import TaskPool as PreforkPool
+
+        if autoscale:
+            raise ImproperlyConfigured(
+                'worker_async_concurrency cannot be used with --autoscale.')
+        if not self.use_eventloop:
+            raise ImproperlyConfigured(
+                'worker_async_concurrency requires the event loop, '
+                'which the broker transport or platform does not support.')
+        if self.async_processes < 1:
+            raise ImproperlyConfigured(
+                'worker_async_processes must be at least 1, '
+                f'got {self.async_processes!r}.')
+        # Each async process runs at least one task.
+        self.async_processes = min(self.async_processes, self.async_concurrency)
+        if self.pool_cls is PreforkPool:
+            self.pool_cls = _concurrency.get_implementation(ASYNC_POOL)
+        elif not getattr(self.pool_cls, 'supports_async_concurrency', False):
+            raise ImproperlyConfigured(
+                'worker_async_concurrency requires the prefork pool, '
+                f'got {self.pool_cls!r}.')
 
     def on_init_blueprint(self):
         pass
@@ -450,7 +485,8 @@ class WorkController:
                        prefetch_multiplier=None, disable_rate_limits=None,
                        worker_lost_wait=None,
                        max_memory_per_child=None,
-                       pool_start_method=None, **_kw):
+                       pool_start_method=None,
+                       aconcurrency=None, aprocesses=None, **_kw):
         either = self.app.either
         self.loglevel = loglevel
         self.logfile = logfile
@@ -497,6 +533,16 @@ class WorkController:
             'worker_disable_rate_limits', disable_rate_limits,
         )
         self.worker_lost_wait = either('worker_lost_wait', worker_lost_wait)
+        self.async_concurrency = int(either(
+            'worker_async_concurrency', aconcurrency,
+        ) or 0)
+        if self.async_concurrency < 0:
+            raise ImproperlyConfigured(
+                'worker_async_concurrency must not be negative, '
+                f'got {self.async_concurrency!r}.')
+        self.async_processes = int(either(
+            'worker_async_processes', aprocesses,
+        ))
 
     def wait_for_soft_shutdown(self):
         """Wait :setting:`worker_soft_shutdown_timeout` if soft shutdown is enabled.

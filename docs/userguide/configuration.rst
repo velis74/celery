@@ -3716,6 +3716,67 @@ descriptors, not CPU, and ``solo`` always runs one task at a time. On
 non-Linux platforms or when no cgroup CPU controller is mounted,
 ``"auto"`` resolves to the affinity CPU count as well.
 
+.. setting:: worker_async_concurrency
+
+``worker_async_concurrency``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.8
+
+Default: 0 (disabled).
+
+The number of ``async def`` tasks the worker runs at the same time.
+When greater than 0, the worker starts :setting:`worker_async_processes`
+child processes, no more than the async concurrency, that run these tasks on
+an :mod:`asyncio` event loop, next to the :setting:`worker_concurrency`
+processes that run all other tasks. A task
+runs there when its ``run`` method (or a custom ``__call__``) is a coroutine
+function.
+
+Requires the ``prefork`` pool, which the worker then replaces with
+``celery.concurrency.aio:TaskPool``, or a pool class that sets
+``supports_async_concurrency = True``. Cannot be used with
+:option:`--autoscale <celery worker --autoscale>`, or with a broker transport
+that does not support the worker's event loop.
+
+The initial prefetch count is the sum of both concurrencies multiplied by
+:setting:`worker_prefetch_multiplier`.
+
+The command-line equivalent is the
+:option:`--aconcurrency <celery worker --aconcurrency>` argument.
+
+.. setting:: worker_async_processes
+
+``worker_async_processes``
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.8
+
+Default: 1.
+
+The number of child processes that run ``async def`` tasks when
+:setting:`worker_async_concurrency` is enabled, at most
+:setting:`worker_async_concurrency`. Each process runs up to
+``ceil(worker_async_concurrency / worker_async_processes)`` tasks at the same
+time.
+
+The command-line equivalent is the
+:option:`--aprocesses <celery worker --aprocesses>` argument.
+
+.. setting:: worker_async_block_warning
+
+``worker_async_block_warning``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.8
+
+Default: 1.0.
+
+Seconds after which a child process running ``async def`` tasks logs a
+warning with the current stack of its event loop thread when the loop has not
+run any callback. The warning is logged once per blocking period. 0 disables
+the check; the smallest threshold is 0.04, and smaller values are raised to it.
+
 .. setting:: worker_prefetch_multiplier
 
 ``worker_prefetch_multiplier``

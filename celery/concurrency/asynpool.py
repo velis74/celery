@@ -687,6 +687,13 @@ class AsynPool(_pool.Pool):
     def on_job_ready(self, job, i, obj, inqW_fd):
         self._mark_worker_as_available(inqW_fd)
 
+    def _on_job_scheduled(self, proc, fd, job):
+        """Called when writing ``job`` to the inqueue ``fd`` of ``proc`` is scheduled.
+
+        Marks the process as busy.
+        """
+        self._busy_workers.add(fd)
+
     def _create_process_handlers(self, hub):
         """Create handlers called on process up/down, etc."""
         add_reader, remove_reader, remove_writer = (
@@ -811,7 +818,7 @@ class AsynPool(_pool.Pool):
         hub_add, hub_remove = hub.add, hub.remove
         mark_write_fd_as_active = active_writes.add
         mark_write_gen_as_active = active_writers.add
-        mark_worker_as_busy = busy_workers.add
+        on_job_scheduled = self._on_job_scheduled
         write_generator_done = active_writers.discard
         get_job = self._cache.__getitem__
         write_stats = self.write_stats
@@ -940,7 +947,7 @@ class AsynPool(_pool.Pool):
                         job._writer = ref(cor)
                         mark_write_gen_as_active(cor)
                         mark_write_fd_as_active(ready_fd)
-                        mark_worker_as_busy(ready_fd)
+                        on_job_scheduled(proc, ready_fd, job)
 
                         # Try to write immediately, in case there's an error.
                         try:

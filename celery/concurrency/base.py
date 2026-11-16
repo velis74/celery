@@ -63,6 +63,18 @@ class BasePool:
     #: set to true if tasks run in child processes started by the pool.
     uses_child_processes = False
 
+    #: set to true if the pool runs ``async def`` tasks with the async
+    #: concurrency set by :setting:`worker_async_concurrency`.
+    supports_async_concurrency = False
+
+    #: Semaphore the worker uses to gate tasks instead of its own, or
+    #: :const:`None`.  Its ``acquire(callback, request)`` applies
+    #: ``callback(request)`` once the pool has room for the request,
+    #: ``release()`` called by that callback gives back the request's token
+    #: (for a revoked request), and ``clear()`` resets it when the broker
+    #: connection is lost.
+    task_semaphore = None
+
     _state = None
     _pool = None
     _does_debug = True

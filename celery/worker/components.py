@@ -151,6 +151,12 @@ class Pool(bootsteps.StartStopStep):
             if w.pool_putlocks and w.pool_cls.uses_semaphore:
                 w.process_task = w._process_task_sem
         allow_restart = w.pool_restarts
+        async_options = {}
+        if w.async_concurrency:
+            async_options = {
+                'async_concurrency': w.async_concurrency,
+                'async_processes': w.async_processes,
+            }
         pool = w.pool = self.instantiate(
             w.pool_cls, w.min_concurrency,
             initargs=(w.app, w.hostname),
@@ -167,7 +173,14 @@ class Pool(bootsteps.StartStopStep):
             semaphore=semaphore,
             sched_strategy=self.optimization,
             app=w.app,
+            **async_options
         )
+        task_semaphore = getattr(pool, 'task_semaphore', None)
+        if semaphore is not None and task_semaphore is not None:
+            # The pool gates tasks with its own semaphore.
+            w.semaphore = task_semaphore
+            w._quick_acquire = task_semaphore.acquire
+            w._quick_release = task_semaphore.release
         _set_task_join_will_block(pool.task_join_will_block)
         return pool
 
@@ -227,7 +240,9 @@ class Consumer(bootsteps.StartStopStep):
         if w.max_concurrency:
             prefetch_count = max(w.max_concurrency, 1) * w.prefetch_multiplier
         else:
-            prefetch_count = w.concurrency * w.prefetch_multiplier
+            prefetch_count = (
+                (w.concurrency + w.async_concurrency) * w.prefetch_multiplier
+            )
         c = w.consumer = self.instantiate(
             w.consumer_cls, w.process_task,
             hostname=w.hostname,

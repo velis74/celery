@@ -231,3 +231,21 @@ class test_shutdown_handler:
         callback.assert_not_called()
         safe_say_mock.assert_not_called()
         assert state.should_stop == 0
+
+
+class test_Worker_startup_info:
+
+    @pytest.fixture(autouse=True)
+    def _setup_app(self, app):
+        self.app = app
+
+    def test_without_async_concurrency(self):
+        worker = Worker(app=self.app, hostname='test@example.com',
+                        concurrency=2, pool='solo')
+        assert 'async:' not in worker.startup_info()
+
+    def test_with_async_concurrency(self):
+        worker = Worker(app=self.app, hostname='test@example.com',
+                        concurrency=2, pool='solo')
+        worker.async_concurrency, worker.async_processes = 50, 2
+        assert '2 (solo), async: 50 in 2 process(es)' in worker.startup_info()

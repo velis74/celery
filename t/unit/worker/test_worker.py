@@ -967,6 +967,63 @@ class test_WorkController(ConsumerCase):
         )
         assert worker.autoscaler
 
+    def test_async_concurrency_disabled_by_default(self):
+        worker = self.create_worker(pool_cls='prefork')
+        assert worker.async_concurrency == 0
+        assert worker.async_processes == 1
+        assert worker.pool_cls.__module__ == 'celery.concurrency.prefork'
+
+    def test_async_concurrency_from_arguments(self):
+        with patch('celery.worker.worker.ASYNC_POOL',
+                   'celery.concurrency.solo:TaskPool'):
+            worker = self.create_worker(
+                pool_cls='prefork', aconcurrency=20, aprocesses=2,
+                use_eventloop=True,
+            )
+        assert worker.async_concurrency == 20
+        assert worker.async_processes == 2
+        assert worker.pool_cls.__module__ == 'celery.concurrency.solo'
+
+    def test_async_concurrency_from_settings(self):
+        self.app.conf.worker_async_concurrency = 8
+        self.app.conf.worker_async_processes = 3
+        with patch('celery.worker.worker.ASYNC_POOL',
+                   'celery.concurrency.solo:TaskPool'):
+            worker = self.create_worker(pool_cls='prefork',
+                                        use_eventloop=True)
+        assert worker.async_concurrency == 8
+        assert worker.async_processes == 3
+
+    def test_async_processes_capped_at_async_concurrency(self):
+        with patch('celery.worker.worker.ASYNC_POOL',
+                   'celery.concurrency.solo:TaskPool'):
+            worker = self.create_worker(
+                pool_cls='prefork', aconcurrency=2, aprocesses=4,
+                use_eventloop=True,
+            )
+        assert worker.async_processes == 2
+
+    def test_async_concurrency_keeps_supporting_pool(self):
+        class Pool(BasePool):
+            supports_async_concurrency = True
+        worker = self.create_worker(pool_cls=Pool, aconcurrency=4,
+                                    use_eventloop=True)
+        assert worker.pool_cls is Pool
+
+    @pytest.mark.parametrize('kwargs', [
+        {'pool_cls': 'solo', 'use_eventloop': True},
+        {'pool_cls': 'prefork', 'use_eventloop': False},
+        {'pool_cls': 'prefork', 'use_eventloop': True, 'autoscale': [4, 1]},
+        {'pool_cls': 'prefork', 'use_eventloop': True, 'aprocesses': 0},
+    ])
+    def test_async_concurrency_improperly_configured(self, kwargs):
+        with pytest.raises(ImproperlyConfigured):
+            self.create_worker(aconcurrency=4, **kwargs)
+
+    def test_async_concurrency_negative(self):
+        with pytest.raises(ImproperlyConfigured):
+            self.create_worker(aconcurrency=-1)
+
     def test_concurrency_explicit_int_unchanged(self):
         worker = self.app.WorkController(
             concurrency=4, pool_cls='prefork', loglevel=0,
