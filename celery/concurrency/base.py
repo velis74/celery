@@ -60,6 +60,9 @@ class BasePool:
     #: set to true if pool uses greenlets.
     is_green = False
 
+    #: set to true if tasks run in child processes started by the pool.
+    uses_child_processes = False
+
     _state = None
     _pool = None
     _does_debug = True

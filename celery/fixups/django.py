@@ -1,17 +1,19 @@
 """Django-specific customization."""
+import asyncio
 import contextlib
 import os
 import sys
 import warnings
 from datetime import datetime, timezone
 from importlib import import_module
-from typing import IO, TYPE_CHECKING, Any, List, Optional, cast
+from typing import IO, TYPE_CHECKING, Any, Dict, List, Optional, cast
 from uuid import uuid4
 
 from kombu.utils.imports import symbol_by_name
 from kombu.utils.objects import cached_property
 
 from celery import _state, signals
+from celery.app.trace import get_task_awaiter, is_async_task
 from celery.exceptions import FixupWarning, ImproperlyConfigured
 from celery.local import Proxy
 from celery.utils.log import get_logger
@@ -52,6 +54,20 @@ def _maybe_close_fd(fh: IO) -> None:
 def _unwrap_app(app: Any) -> Any:
     """Return the app behind a proxy such as ``current_app``."""
     return app._get_current_object() if isinstance(app, Proxy) else app
+
+
+def _in_event_loop() -> bool:
+    """Return true if the current thread is running an asyncio event loop."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    return True
+
+
+def _is_coroutine_task(task: Any) -> bool:
+    """Return true if the body of *task* is a coroutine function."""
+    return is_async_task(task)
 
 
 def _verify_django_version(django: "ModuleType") -> None:
@@ -180,6 +196,7 @@ class DjangoWorkerFixup:
             symbol_by_name('django.db.utils.InterfaceError'),
         )
         self.DatabaseError = symbol_by_name('django.db:DatabaseError')
+        self._coroutine_task_types: Dict[type, bool] = {}
 
     def django_setup(self) -> None:
         import django
@@ -229,18 +246,45 @@ class DjangoWorkerFixup:
         except self.interface_errors:
             pass
 
+    def _manages_connections_for(self, task: "Task") -> bool:
+        if getattr(task.request, 'is_eager', False):
+            return False
+        if get_task_awaiter() is None:
+            return True
+        # Under a task awaiter, a coroutine task runs on an event loop in
+        # another thread than the one that sends the prerun/postrun signals.
+        task_type = type(task)
+        try:
+            is_coroutine = self._coroutine_task_types[task_type]
+        except KeyError:
+            is_coroutine = self._coroutine_task_types[task_type] = \
+                _is_coroutine_task(task)
+        return not is_coroutine
+
     def on_task_prerun(self, sender: "Task", **kwargs: Any) -> None:
         """Called before every task."""
-        if not getattr(sender.request, 'is_eager', False):
+        if self._manages_connections_for(sender):
             self.close_database()
 
     def on_task_postrun(self, sender: "Task", **kwargs: Any) -> None:
         # See https://groups.google.com/group/django-users/browse_thread/thread/78200863d0c07c6d/
-        if not getattr(sender.request, 'is_eager', False):
-            self.close_database()
-            self.close_cache()
+        if self._manages_connections_for(sender):
+            self.close_connections()
+
+    def close_connections(self) -> None:
+        """Close database connections and caches at the end of a task.
+
+        Honours ``CELERY_DB_REUSE_MAX``.  Must be called without a running
+        event loop in the current thread, otherwise it does nothing.
+        """
+        self.close_database()
+        self.close_cache()
 
     def close_database(self, **kwargs: Any) -> None:
+        if _in_event_loop():
+            logger.debug('Django fixup: not closing database connections '
+                         'in a thread with a running event loop.')
+            return
         if not self.db_reuse_max:
             return self._close_database()
         if self._db_recycles >= self.db_reuse_max * 2:
@@ -251,10 +295,16 @@ class DjangoWorkerFixup:
     def _is_prefork(self) -> bool:
         if self.worker is None:
             return False
-        pool = self.worker.pool_cls if isinstance(self.worker.pool_cls, str) else self.worker.pool_cls.__module__
-        return "prefork" in pool
+        pool_cls = self.worker.pool_cls
+        if isinstance(pool_cls, str):
+            return "prefork" in pool_cls
+        return getattr(pool_cls, 'uses_child_processes', False) is True or "prefork" in pool_cls.__module__
 
     def _close_database(self) -> None:
+        if _in_event_loop():
+            logger.debug('Django fixup: not closing database connections '
+                         'in a thread with a running event loop.')
+            return
         try:
             connections = self._db.connections.all(initialized_only=True)
         except TypeError:
@@ -278,6 +328,10 @@ class DjangoWorkerFixup:
                     raise
 
     def close_cache(self) -> None:
+        if _in_event_loop():
+            logger.debug('Django fixup: not closing caches '
+                         'in a thread with a running event loop.')
+            return
         try:
             self._cache.close_caches()
         except (TypeError, AttributeError):

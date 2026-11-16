@@ -153,6 +153,7 @@ class TaskPool(BasePool):
     BlockingPool = BlockingPool
 
     uses_semaphore = True
+    uses_child_processes = True
     write_stats = None
 
     def on_start(self):

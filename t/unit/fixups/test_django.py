@@ -1,11 +1,17 @@
+import asyncio
+import functools
 from contextlib import contextmanager
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
 
-from celery import Celery, signals
+from celery import Celery, Task, signals
+from celery.app.trace import set_task_awaiter
+from celery.concurrency.base import BasePool
+from celery.concurrency.prefork import TaskPool as PreforkTaskPool
 from celery.concurrency.thread import TaskPool as ThreadTaskPool
-from celery.fixups.django import DjangoFixup, DjangoWorkerFixup, FixupWarning, _maybe_close_fd, fixup
+from celery.fixups.django import (DjangoFixup, DjangoWorkerFixup, FixupWarning, _in_event_loop, _is_coroutine_task,
+                                  _maybe_close_fd, fixup)
 from celery.local import Proxy
 from t.unit import conftest
 
@@ -349,6 +355,86 @@ class InterfaceError(Exception):
     pass
 
 
+def run_in_event_loop(fun, *args, **kwargs):
+    """Call *fun* from a coroutine running on a new event loop."""
+    async def main():
+        return fun(*args, **kwargs)
+    return asyncio.run(main())
+
+
+def test_in_event_loop():
+    assert not _in_event_loop()
+    assert run_in_event_loop(_in_event_loop)
+
+
+class test_is_coroutine_task:
+
+    def test_sync_task(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+        assert not _is_coroutine_task(add)
+
+    def test_async_task(self):
+        @self.app.task(shared=False)
+        async def add(x, y):
+            return x + y
+        assert _is_coroutine_task(add)
+
+    def test_async_bound_task(self):
+        @self.app.task(shared=False, bind=True)
+        async def add(self, x, y):
+            return x + y
+        assert _is_coroutine_task(add)
+
+    def test_async_task_with_autoretry(self):
+        @self.app.task(shared=False, autoretry_for=(KeyError,))
+        async def add(x, y):
+            return x + y
+        assert hasattr(add, '_orig_run')
+        assert _is_coroutine_task(add)
+
+    def test_sync_task_with_autoretry(self):
+        @self.app.task(shared=False, autoretry_for=(KeyError,))
+        def add(x, y):
+            return x + y
+        assert not _is_coroutine_task(add)
+
+    def test_async_task_with_pydantic(self):
+        pytest.importorskip('pydantic')
+
+        @self.app.task(shared=False, pydantic=True)
+        async def add(x: int, y: int) -> int:
+            return x + y
+        assert _is_coroutine_task(add)
+
+    def test_async_class_based_task(self):
+        class AddTask(Task):
+            async def run(self, x, y):
+                return x + y
+        assert _is_coroutine_task(AddTask())
+
+    def test_sync_class_based_task(self):
+        class AddTask(Task):
+            def run(self, x, y):
+                return x + y
+        assert not _is_coroutine_task(AddTask())
+
+    def test_sync_wrapper_around_async_function(self):
+        def run_sync(fun):
+            @functools.wraps(fun)
+            def wrapper(*args, **kwargs):
+                return asyncio.run(fun(*args, **kwargs))
+            return wrapper
+
+        @self.app.task(shared=False)
+        @run_sync
+        async def add(x, y):
+            return x + y
+        assert _is_coroutine_task(add)
+        assert add(1, 2) == 3
+
+
 class test_DjangoWorkerFixup(FixupCase):
     Fixup = DjangoWorkerFixup
 
@@ -422,6 +508,121 @@ class test_DjangoWorkerFixup(FixupCase):
                     f.on_task_postrun(task)
                     f.close_database.assert_not_called()
                     f.close_cache.assert_not_called()
+
+    @pytest.mark.parametrize('method', ['on_task_prerun', 'on_task_postrun'])
+    def test_on_task_signal_skips_coroutine_task(self, method):
+        @self.app.task(shared=False)
+        async def add(x, y):
+            return x + y
+        add.push_request(is_eager=False)
+        set_task_awaiter(Mock(name='awaiter'))
+        try:
+            with self.fixup_context(self.app) as (f, _, _):
+                with patch.object(f, 'close_database'), patch.object(f, 'close_cache'):
+                    getattr(f, method)(add)
+                    getattr(f, method)(add)
+                    f.close_database.assert_not_called()
+                    f.close_cache.assert_not_called()
+                assert f._coroutine_task_types == {type(add): True}
+        finally:
+            set_task_awaiter(None)
+            add.pop_request()
+
+    @pytest.mark.parametrize('method', ['on_task_prerun', 'on_task_postrun'])
+    def test_on_task_signal_handles_coroutine_task_without_awaiter(self, method):
+        # Without a task awaiter the tracer does not await the coroutine.
+        @self.app.task(shared=False)
+        async def add(x, y):
+            return x + y
+        add.push_request(is_eager=False)
+        try:
+            with self.fixup_context(self.app) as (f, _, _):
+                with patch.object(f, 'close_database'), patch.object(f, 'close_cache'):
+                    getattr(f, method)(add)
+                    f.close_database.assert_called_once_with()
+                assert f._coroutine_task_types == {}
+        finally:
+            add.pop_request()
+
+    def test_on_task_signal_handles_sync_wrapper_without_awaiter(self):
+        # A sync decorator that runs the coroutine itself, on a worker
+        # without async concurrency.
+        def run_sync(fun):
+            @functools.wraps(fun)
+            def wrapper(*args, **kwargs):
+                return asyncio.run(fun(*args, **kwargs))
+            return wrapper
+
+        @self.app.task(shared=False)
+        @run_sync
+        async def add(x, y):
+            return x + y
+        add.push_request(is_eager=False)
+        try:
+            with self.fixup_context(self.app) as (f, _, _):
+                with patch.object(f, 'close_database'), patch.object(f, 'close_cache'):
+                    f.on_task_prerun(add)
+                    f.on_task_postrun(add)
+                    assert f.close_database.call_count == 2
+                    f.close_cache.assert_called_once_with()
+        finally:
+            add.pop_request()
+
+    @pytest.mark.parametrize('method', ['on_task_prerun', 'on_task_postrun'])
+    def test_on_task_signal_handles_sync_task(self, method):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+        add.push_request(is_eager=False)
+        try:
+            with self.fixup_context(self.app) as (f, _, _):
+                with patch.object(f, 'close_database'), patch.object(f, 'close_cache'):
+                    getattr(f, method)(add)
+                    f.close_database.assert_called_once_with()
+        finally:
+            add.pop_request()
+
+    def test_close_connections(self):
+        with self.fixup_context(self.app) as (f, _, _):
+            with patch.object(f, 'close_database'), patch.object(f, 'close_cache'):
+                f.close_connections()
+                f.close_database.assert_called_once_with()
+                f.close_cache.assert_called_once_with()
+
+    def test_close_database_in_event_loop(self):
+        with self.fixup_context(self.app) as (f, _, _):
+            with patch.object(f, '_close_database') as _close:
+                f.db_reuse_max = 10
+                f._db_recycles = 3
+                run_in_event_loop(f.close_database)
+                _close.assert_not_called()
+                assert f._db_recycles == 3
+
+    def test__close_database_in_event_loop(self):
+        with self.fixup_context(self.app) as (f, _, _):
+            conn = Mock()
+            f._db.connections.all = Mock(return_value=[conn])
+            run_in_event_loop(f._close_database)
+            f._db.connections.all.assert_not_called()
+            conn.close.assert_not_called()
+
+            f._close_database()
+            conn.close.assert_called_once_with()
+
+    def test_close_cache_in_event_loop(self):
+        with self.fixup_context(self.app) as (f, _, _):
+            run_in_event_loop(f.close_cache)
+            f._cache.close_caches.assert_not_called()
+
+    def test_on_worker_process_init_in_event_loop(self):
+        with self.fixup_context(self.app) as (f, _, _):
+            conn = MagicMock()
+            f._db.connections.all = Mock(return_value=[conn])
+            with patch('celery.fixups.django._maybe_close_fd') as mcf:
+                run_in_event_loop(f.on_worker_process_init)
+                mcf.assert_called_once_with(conn.connection)
+            conn.close.assert_not_called()
+            f._cache.close_caches.assert_not_called()
 
     def test_close_database(self):
         with self.fixup_context(self.app) as (f, _, _):
@@ -629,7 +830,29 @@ class test_DjangoWorkerFixup(FixupCase):
             f.worker.pool_cls = Mock(__module__='celery.concurrency.thread')
             assert not f._is_prefork()
 
+            f.worker.pool_cls = PreforkTaskPool
+            assert f._is_prefork()
+
+            f.worker.pool_cls = ThreadTaskPool
+            assert not f._is_prefork()
+
             f.worker = None
+            assert not f._is_prefork()
+
+    def test__is_prefork_uses_child_processes(self):
+        class ChildProcessPool(BasePool):
+            uses_child_processes = True
+        ChildProcessPool.__module__ = 'celery.concurrency.aio'
+
+        class InProcessPool(BasePool):
+            pass
+        InProcessPool.__module__ = 'celery.concurrency.aio'
+
+        with self.fixup_context(self.app) as (f, _, _):
+            f.worker.pool_cls = ChildProcessPool
+            assert f._is_prefork()
+
+            f.worker.pool_cls = InProcessPool
             assert not f._is_prefork()
 
     def test_no_recursive_worker_instantiation(self, patching):
