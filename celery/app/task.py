@@ -544,10 +544,22 @@ class Task:
         setattr(cls, attr, meth)
 
     def __call__(self, *args, **kwargs):
+        if inspect.iscoroutinefunction(self.run):
+            return self._async_call(args, kwargs)
         _task_stack.push(self)
         self.push_request(args=args, kwargs=kwargs)
         try:
             return self.run(*args, **kwargs)
+        finally:
+            self.pop_request()
+            _task_stack.pop()
+
+    async def _async_call(self, args, kwargs):
+        # The request stays pushed until the coroutine returns.
+        _task_stack.push(self)
+        self.push_request(args=args, kwargs=kwargs)
+        try:
+            return await self.run(*args, **kwargs)
         finally:
             self.pop_request()
             _task_stack.pop()
@@ -977,6 +989,11 @@ class Task:
 
         Returns:
             celery.result.EagerResult: pre-evaluated result.
+
+        Note:
+            The awaitable returned by an ``async def`` task is resolved
+            with the awaiter set by :func:`celery.app.trace.set_task_awaiter`.
+            With no awaiter set, the awaitable itself is the result.
         """
         # trace imports Task, so need to import inline.
         from celery.app.trace import build_tracer

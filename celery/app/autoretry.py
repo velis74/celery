@@ -1,4 +1,6 @@
 """Tasks auto-retry functionality."""
+import inspect
+
 from vine.utils import wraps
 
 from celery.exceptions import Ignore, Retry
@@ -32,35 +34,56 @@ def add_autoretry_behaviour(task, **options):
 
     if autoretry_for and not hasattr(task, '_orig_run'):
 
-        @wraps(task.run)
-        def run(*args, **kwargs):
-            try:
-                return task._orig_run(*args, **kwargs)
-            except Ignore:
-                # If Ignore signal occurs task shouldn't be retried,
-                # even if it suits autoretry_for list
-                raise
-            except Retry:
-                raise
-            except dont_autoretry_for:
-                raise
-            except autoretry_for as exc:
-                retry_kwargs_for_attempt = retry_kwargs.copy()
-                if retry_backoff:
-                    retry_kwargs_for_attempt['countdown'] = \
-                        get_exponential_backoff_interval(
-                            factor=int(max(1.0, retry_backoff)),
-                            retries=task.request.retries,
-                            maximum=retry_backoff_max,
-                            full_jitter=retry_jitter)
-                # Override max_retries
-                if hasattr(task, 'override_max_retries'):
-                    retry_kwargs_for_attempt['max_retries'] = getattr(
-                        task, 'override_max_retries', task.max_retries)
-                ret = task.retry(exc=exc, **retry_kwargs_for_attempt)
-                # Stop propagation
-                if hasattr(task, 'override_max_retries'):
-                    delattr(task, 'override_max_retries')
-                raise ret
+        def retry_for(exc):
+            retry_kwargs_for_attempt = retry_kwargs.copy()
+            if retry_backoff:
+                retry_kwargs_for_attempt['countdown'] = \
+                    get_exponential_backoff_interval(
+                        factor=int(max(1.0, retry_backoff)),
+                        retries=task.request.retries,
+                        maximum=retry_backoff_max,
+                        full_jitter=retry_jitter)
+            # Override max_retries
+            if hasattr(task, 'override_max_retries'):
+                retry_kwargs_for_attempt['max_retries'] = getattr(
+                    task, 'override_max_retries', task.max_retries)
+            ret = task.retry(exc=exc, **retry_kwargs_for_attempt)
+            # Stop propagation
+            if hasattr(task, 'override_max_retries'):
+                delattr(task, 'override_max_retries')
+            return ret
+
+        if inspect.iscoroutinefunction(task.run):
+
+            @wraps(task.run)
+            async def run(*args, **kwargs):
+                try:
+                    return await task._orig_run(*args, **kwargs)
+                except Ignore:
+                    # If Ignore signal occurs task shouldn't be retried,
+                    # even if it suits autoretry_for list
+                    raise
+                except Retry:
+                    raise
+                except dont_autoretry_for:
+                    raise
+                except autoretry_for as exc:
+                    raise retry_for(exc)
+        else:
+
+            @wraps(task.run)
+            def run(*args, **kwargs):
+                try:
+                    return task._orig_run(*args, **kwargs)
+                except Ignore:
+                    # If Ignore signal occurs task shouldn't be retried,
+                    # even if it suits autoretry_for list
+                    raise
+                except Retry:
+                    raise
+                except dont_autoretry_for:
+                    raise
+                except autoretry_for as exc:
+                    raise retry_for(exc)
 
         task._orig_run, task.run = task.run, run
