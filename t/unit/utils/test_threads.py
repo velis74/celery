@@ -1,11 +1,18 @@
+import asyncio
+import contextvars
 import socket
+import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 
-from celery.utils.threads import (Local, LocalManager, _FastLocalStack, _LocalStack, bgThread,
-                                  bound_open_broker_sockets, default_socket_timeout)
+from celery import _state
+from celery.app.task import Task
+from celery.utils.threads import (Local, LocalManager, LocalStack, _context_stacks, _ContextLocalStack,
+                                  _FastLocalStack, _LocalStack, bgThread, bound_open_broker_sockets,
+                                  default_socket_timeout, release_local)
 from t.unit import conftest
 
 
@@ -204,6 +211,237 @@ class test_LocalStack:
         x.pop()
         with pytest.raises(RuntimeError):
             x()[0]
+
+
+class test_ContextLocalStack:
+
+    def test_stack(self):
+        x = _ContextLocalStack()
+        assert x.pop() is None
+        assert x.top is None
+        assert x.stack == []
+        assert len(x) == 0
+        with pytest.raises(RuntimeError):
+            x()[0]
+
+        assert x.push(['foo']) == [['foo']]
+        assert x.push(['bar']) == [['foo'], ['bar']]
+        assert x.top == ['bar']
+        assert x()[0] == 'bar'
+        assert x.stack == [['foo'], ['bar']]
+        assert len(x) == 2
+        assert x.pop() == ['bar']
+        assert x.top == ['foo']
+        assert x.pop() == ['foo']
+        assert x.pop() is None
+        with pytest.raises(RuntimeError):
+            x()[0]
+
+    def test_stack_is_a_copy(self):
+        x = _ContextLocalStack()
+        x.push(1)
+        x.stack.append(2)
+        x.push(3).append(4)
+        assert x.stack == [1, 3]
+
+    def test_release_local(self):
+        x = _ContextLocalStack()
+        x.push(1)
+        x.push(2)
+        release_local(x)
+        assert x.top is None
+        assert len(x) == 0
+
+    def test_instances_are_independent(self):
+        x, y = _ContextLocalStack(), _ContextLocalStack()
+        x.push(1)
+        assert y.top is None
+        x.pop()
+
+    def test_attribute_can_be_patched(self):
+        x = _ContextLocalStack()
+        with patch.object(x, 'push', wraps=x.push) as push:
+            x.push(1)
+        push.assert_called_once_with(1)
+        assert x.pop() == 1
+
+    def test_class_getitem(self):
+        assert isinstance(_ContextLocalStack[int](), _ContextLocalStack)
+
+    def test_default_local_stack(self):
+        assert LocalStack is _ContextLocalStack
+        assert isinstance(_state._task_stack, _ContextLocalStack)
+
+    def test_threads_are_isolated(self):
+        x = _ContextLocalStack()
+        x.push('main')
+        barrier = threading.Barrier(3)
+        seen = {}
+
+        def target(n):
+            seen[n] = [x.top]
+            x.push(n)
+            barrier.wait()
+            seen[n].append(x.stack)
+            seen[n].append(x.pop())
+
+        threads = [threading.Thread(target=target, args=(n,)) for n in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        inherited = ['main'] if getattr(sys.flags, 'thread_inherit_context', 0) else []
+        for n in range(3):
+            assert seen[n] == [inherited[-1] if inherited else None, inherited + [n], n]
+        assert x.stack == ['main']
+        assert x.pop() == 'main'
+
+    def test_thread_with_copied_context_keeps_snapshot(self):
+        x = _ContextLocalStack()
+        x.push('request-A')
+        ctx = contextvars.copy_context()
+        x.pop()
+        x.push('request-B')
+        started, release = threading.Event(), threading.Event()
+        seen = []
+
+        def target():
+            seen.append(x.top)
+            started.set()
+            release.wait(10)
+            seen.append(x.stack)
+            x.push('thread')
+
+        t = threading.Thread(target=ctx.run, args=(target,))
+        t.start()
+        started.wait(10)
+        x.pop()
+        release.set()
+        t.join()
+        assert seen == ['request-A', ['request-A']]
+        assert x.top is None
+
+    def test_context_does_not_grow(self):
+        base = len(contextvars.copy_context())
+        for _ in range(100):
+            x = _ContextLocalStack()
+            x.push(1)
+            x.pop()
+            y = _ContextLocalStack()
+            y.push(2)
+            release_local(y)
+        assert len(contextvars.copy_context()) <= base + 1
+
+    def test_empty_stack_is_not_referenced(self):
+        x = _ContextLocalStack()
+        x.push(1)
+        x.pop()
+        assert x not in _context_stacks.get()
+
+    def test_asyncio_tasks_are_isolated(self):
+        x = _ContextLocalStack()
+        x.push('outer')
+
+        async def worker(n):
+            x.push(n)
+            await asyncio.sleep(0)
+            stack = x.stack
+            await asyncio.sleep(0)
+            return stack, x.pop()
+
+        async def main():
+            return await asyncio.gather(*(worker(n) for n in range(3)))
+
+        assert asyncio.run(main()) == [(['outer', n], n) for n in range(3)]
+        assert x.stack == ['outer']
+        assert x.pop() == 'outer'
+
+    def test_run_coroutine_threadsafe_sees_caller_stack(self):
+        x = _ContextLocalStack()
+        loop = asyncio.new_event_loop()
+        loop_thread = threading.Thread(target=loop.run_forever)
+        loop_thread.start()
+        barrier = threading.Barrier(3)
+        seen = {}
+
+        async def coro():
+            await asyncio.sleep(0)
+            return x.top, len(x)
+
+        def caller(n):
+            x.push(('req', n))
+            barrier.wait()
+            try:
+                seen[n] = asyncio.run_coroutine_threadsafe(coro(), loop).result(timeout=10)
+            finally:
+                x.pop()
+
+        try:
+            threads = [threading.Thread(target=caller, args=(n,)) for n in range(3)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            loop_thread.join()
+            loop.close()
+        assert seen == {n: (('req', n), 1) for n in range(3)}
+        assert x.top is None
+
+    def test_gevent_greenlets_are_isolated(self):
+        gevent = pytest.importorskip('gevent')
+        x = _ContextLocalStack()
+
+        def target(n):
+            x.push(n)
+            gevent.sleep(0.01)
+            stack = x.stack
+            return stack, x.pop()
+
+        greenlets = [gevent.spawn(target, n) for n in range(3)]
+        gevent.joinall(greenlets, raise_error=True)
+        assert [g.value for g in greenlets] == [([n], n) for n in range(3)]
+        assert x.top is None
+
+
+class test_task_stacks_are_context_local:
+
+    def test_request_and_current_task(self, app):
+        @app.task(shared=False)
+        def add(x, y):
+            return x + y
+
+        assert isinstance(add.request_stack, _ContextLocalStack)
+
+        async def worker(n):
+            add.push_request(id=f'id-{n}')
+            _state.push_current_task(add)
+            try:
+                await asyncio.sleep(0)
+                return add.request.id, _state.get_current_task() is add
+            finally:
+                _state.pop_current_task()
+                add.pop_request()
+
+        async def main():
+            return await asyncio.gather(*(worker(n) for n in range(3)))
+
+        assert asyncio.run(main()) == [(f'id-{n}', True) for n in range(3)]
+        assert add.request_stack.top is None
+        assert _state.get_current_task() is None
+
+    def test_request_stack_per_task_class(self, app):
+        @app.task(shared=False)
+        def a():
+            pass
+
+        @app.task(shared=False)
+        def b():
+            pass
+
+        assert a.request_stack is not b.request_stack
+        assert Task.request_stack is None
 
 
 class test_FastLocalStack:
