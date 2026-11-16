@@ -227,6 +227,22 @@ def detach(path, argv, logfile=None, pidfile=None, uid=None,
                    "mask (Linux only). For the threads, gevent, "
                    "eventlet and solo pools 'auto' is a no-op and "
                    "uses the number of CPUs available to the process.")
+@click.option('--aconcurrency',
+              type=int,
+              metavar="<async concurrency>",
+              cls=CeleryOption,
+              help_group="Pool Options",
+              help="Number of async def tasks running at the same time in "
+                   "child processes with an asyncio event loop, next to the "
+                   "--concurrency processes running other tasks. "
+                   "Requires the prefork pool. The default is 0 (disabled).")
+@click.option('--aprocesses',
+              type=int,
+              metavar="<async processes>",
+              cls=CeleryOption,
+              help_group="Pool Options",
+              help="Number of child processes sharing the --aconcurrency "
+                   "capacity. The default is 1.")
 @click.option('-P',
               '--pool',
               default='prefork',

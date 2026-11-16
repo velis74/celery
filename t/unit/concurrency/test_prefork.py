@@ -634,6 +634,30 @@ class test_AsynPool:
         assert 2 in hub.readers
 
     @t.skip.if_pypy
+    def test_schedule_writes_calls_on_job_scheduled(self):
+        pool = asynpool.AsynPool(threads=False)
+        hub = self._get_hub()
+        proc = Mock(name='proc')
+        proc.send_job_offset = lambda header, HW: 5
+        pool._all_inqueues = {2}
+        pool._fileno_to_inq[2] = proc
+        pool._on_job_scheduled = Mock(name='on_job_scheduled')
+        pool._create_write_handlers(hub)
+
+        job = ApplyResult({}, lambda x: True)
+        job._payload = [None, None, -1]
+        pool.outbound_buffer.append(job)
+        hub.consolidate_callback(ready_fds=[2])
+
+        pool._on_job_scheduled.assert_called_once_with(proc, 2, job)
+        assert 2 not in pool._busy_workers
+
+    def test_on_job_scheduled_marks_worker_busy(self):
+        pool = asynpool.AsynPool(threads=False)
+        pool._on_job_scheduled(Mock(name='proc'), 7, Mock(name='job'))
+        assert pool._busy_workers == {7}
+
+    @t.skip.if_pypy
     @pytest.mark.parametrize('header_written', [False, True])
     @patch('billiard.pool.Pool._create_worker_process')
     def test_write_job_stops_when_inqueue_not_recovering(

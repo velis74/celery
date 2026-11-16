@@ -261,6 +261,9 @@ class Worker(WorkController):
         if not isinstance(pool, str):
             pool = pool.__module__
         concurrency += f" ({pool.split('.')[-1]})"
+        if self.async_concurrency:
+            concurrency += (f', async: {self.async_concurrency} '
+                            f'in {self.async_processes} process(es)')
         events = 'ON'
         if not self.task_events:
             events = 'OFF (enable -E to monitor tasks in this worker)'

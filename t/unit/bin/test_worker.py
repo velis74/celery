@@ -86,6 +86,21 @@ def test_cli_disable_prefetch_flag(isolated_cli_runner: CliRunner):
         assert kwargs['disable_prefetch'] is True
 
 
+def test_cli_async_concurrency_options(isolated_cli_runner: CliRunner):
+    Logging._setup = True
+    with patch('celery.bin.worker.worker.callback') as worker_callback_mock:
+        res = isolated_cli_runner.invoke(
+            celery,
+            ["-A", "t.unit.bin.proj.app", "worker",
+             "--aconcurrency", "100", "--aprocesses", "2"],
+            catch_exceptions=False,
+        )
+        assert res.exit_code == 0
+        _, kwargs = worker_callback_mock.call_args
+        assert kwargs['aconcurrency'] == 100
+        assert kwargs['aprocesses'] == 2
+
+
 def test_disable_prefetch_affects_qos_behavior(mock_app, mock_consumer):
     mock_app.conf.worker_disable_prefetch = True
     original_can_consume = mock_consumer.task_consumer.channel.qos.can_consume

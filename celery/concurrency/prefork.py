@@ -213,7 +213,7 @@ class TaskPool(BasePool):
     def on_stop(self):
         """Gracefully stop the pool."""
         if self._pool is not None and self._pool._state in (RUN, CLOSE):
-            self._pool.close()
+            self._close_pools()
 
             # Keep firing timers (for heartbeats on async transports) while
             # the pool drains. If not using an async transport, no hub exists
@@ -245,7 +245,7 @@ class TaskPool(BasePool):
                 timer_thread.start()
 
                 try:
-                    self._pool.join()
+                    self._join_pools()
                 finally:
                     shutdown_event.set()
                     timer_thread.join(timeout=1.0)
@@ -265,9 +265,17 @@ class TaskPool(BasePool):
                                 exc_info=True,
                             )
             else:
-                self._pool.join()
+                self._join_pools()
 
             self._pool = None
+
+    def _close_pools(self):
+        """Close the pools stopped by :meth:`on_stop`."""
+        self._pool.close()
+
+    def _join_pools(self):
+        """Wait for the pools closed by :meth:`_close_pools` to finish."""
+        self._pool.join()
 
     def on_terminate(self):
         """Force terminate the pool."""
