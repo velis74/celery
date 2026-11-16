@@ -6,6 +6,7 @@ import threading
 import traceback
 import types
 from contextlib import contextmanager
+from contextvars import ContextVar
 from threading import TIMEOUT_MAX as THREAD_TIMEOUT_MAX
 
 from celery.local import Proxy
@@ -309,6 +310,97 @@ class _LocalStack:
             return None
 
 
+#: Maps each non-empty :class:`_ContextLocalStack` to its items.  One
+#: variable serves all stacks, so creating stacks does not grow the context.
+_context_stacks = ContextVar('celery.utils.threads.context_stacks', default={})
+
+
+class _ContextLocalStack:
+    """Stack bound to the current :mod:`contextvars` context.
+
+    Each thread, greenlet and :class:`asyncio.Task` has its own stack, and a
+    coroutine scheduled with :func:`asyncio.run_coroutine_threadsafe` sees
+    the stack of the calling thread.  The items are an immutable tuple and
+    every push and pop sets a new mapping, so copied contexts never share
+    items.
+
+    A thread started with a copy of the current context (the default with
+    ``-X thread_inherit_context=1``, and on free-threaded builds, from
+    Python 3.14) begins with the stack of its parent as it was at thread
+    start, and keeps it for the lifetime of the thread, including in the
+    worker threads of a :class:`~concurrent.futures.ThreadPoolExecutor`.
+
+    Has the same interface as :class:`_LocalStack`.
+    """
+
+    def __init__(self, name='celery.utils.threads.LocalStack'):
+        self.name = name
+
+    def _get(self):
+        return _context_stacks.get().get(self, ())
+
+    def _set(self, stack):
+        stacks = dict(_context_stacks.get())
+        if stack:
+            stacks[self] = stack
+        else:
+            stacks.pop(self, None)
+        _context_stacks.set(stacks)
+
+    def __release_local__(self):
+        self._set(())
+
+    def __call__(self):
+        def _lookup():
+            rv = self.top
+            if rv is None:
+                raise RuntimeError('object unbound')
+            return rv
+        return Proxy(_lookup)
+
+    def push(self, obj):
+        """Push a new item to the stack.
+
+        Returns:
+            list: A copy of the stack after the push.
+        """
+        stack = self._get() + (obj,)
+        self._set(stack)
+        return list(stack)
+
+    def pop(self):
+        """Remove the topmost item from the stack.
+
+        Note:
+            Will return the old value or `None` if the stack was already empty.
+        """
+        stack = self._get()
+        if not stack:
+            return None
+        self._set(stack[:-1])
+        return stack[-1]
+
+    __class_getitem__ = classmethod(types.GenericAlias)
+
+    def __len__(self):
+        return len(self._get())
+
+    @property
+    def stack(self):
+        """A copy of the stack as a list, bottom item first."""
+        return list(self._get())
+
+    @property
+    def top(self):
+        """The topmost item on the stack.
+
+        Note:
+            If the stack is empty, :const:`None` is returned.
+        """
+        stack = self._get()
+        return stack[-1] if stack else None
+
+
 class LocalManager:
     """Local objects cannot manage themselves.
 
@@ -383,8 +475,6 @@ class _FastLocalStack(threading.local):
 if USE_FAST_LOCALS:  # pragma: no cover
     LocalStack = _FastLocalStack
 else:  # pragma: no cover
-    # - See #706
-    # since each thread has its own greenlet we can just use those as
-    # identifiers for the context.  If greenlets aren't available we
-    # fall back to the  current thread ident.
-    LocalStack = _LocalStack
+    # Context-local, so that threads, greenlets and asyncio tasks each
+    # have their own stack.
+    LocalStack = _ContextLocalStack
