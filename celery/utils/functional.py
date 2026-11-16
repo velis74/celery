@@ -18,7 +18,7 @@ __all__ = (
     'LRUCache', 'is_list', 'maybe_list', 'memoize', 'mlazy', 'noop',
     'first', 'firstmethod', 'chunks', 'padlist', 'mattrgetter', 'uniq',
     'regen', 'dictfilter', 'lazy', 'maybe_evaluate', 'head_from_fun',
-    'maybe', 'fun_accepts_kwargs',
+    'maybe', 'fun_accepts_kwargs', 'is_async_callable',
 )
 
 FUNHEAD_TEMPLATE = """
@@ -481,6 +481,23 @@ def seq_concat_item(seq, item):
            otherwise it depends on the implementation of ``__add__``.
     """
     return seq + (item,) if isinstance(seq, tuple) else seq + [item]
+
+
+def is_async_callable(fun):
+    """Return true if ``fun``, or a callable it wraps, is a coroutine function.
+
+    Follows the ``__wrapped__`` chain set by :func:`functools.wraps`, so a
+    synchronous decorator around an ``async def`` function is detected too.
+    Such a decorator may run the coroutine itself, so a true result does not
+    mean that calling ``fun`` returns an awaitable.
+    """
+    if inspect.iscoroutinefunction(fun):
+        return True
+    try:
+        unwrapped = inspect.unwrap(fun, stop=inspect.iscoroutinefunction)
+    except ValueError:  # cycle in the __wrapped__ chain
+        return False
+    return inspect.iscoroutinefunction(unwrapped)
 
 
 def seq_concat_seq(a, b):

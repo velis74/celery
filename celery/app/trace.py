@@ -3,6 +3,7 @@
 This module defines how the task execution is traced:
 errors are recorded, handlers are applied and so on.
 """
+import inspect
 import logging
 import os
 import sys
@@ -23,6 +24,7 @@ from celery.app.task import Task as BaseTask
 from celery.app.task import get_actual_ignore_result
 from celery.exceptions import BackendGetMetaError, Ignore, InvalidTaskError, Reject, Retry
 from celery.result import AsyncResult
+from celery.utils.functional import is_async_callable
 from celery.utils.log import get_logger
 from celery.utils.nodenames import gethostname
 from celery.utils.objects import mro_lookup
@@ -44,6 +46,7 @@ from celery.utils.serialization import get_pickleable_etype, get_pickleable_exce
 __all__ = (
     'TraceInfo', 'build_tracer', 'trace_task',
     'setup_worker_optimizations', 'reset_worker_optimizations',
+    'is_async_task', 'get_task_awaiter', 'set_task_awaiter',
 )
 
 from celery.worker.state import successful_requests
@@ -118,6 +121,9 @@ IGNORE_STATES = frozenset({IGNORED, RETRY, REJECTED})
 _localized = []
 _patched = {}
 
+#: set by :func:`set_task_awaiter`
+_task_awaiter = None
+
 trace_ok_t = namedtuple('trace_ok_t', ('retval', 'info', 'runtime', 'retstr'))
 
 
@@ -133,6 +139,42 @@ def task_has_custom(task, attr):
     """Return true if the task overrides ``attr``."""
     return mro_lookup(task.__class__, attr, stop={BaseTask, object},
                       monkey_patched=['celery.app.task'])
+
+
+def is_async_task(task):
+    """Return true if the body of ``task`` is a coroutine function.
+
+    Checks the task's ``run`` method, or a custom ``__call__``, also behind
+    decorators that set ``__wrapped__``.  A synchronous decorator may run
+    the coroutine itself, so the tracer resolves the return value only
+    when it is awaitable.
+    """
+    if is_async_callable(task.run):
+        return True
+    return bool(task_has_custom(task, '__call__')) and \
+        is_async_callable(type(task).__call__)
+
+
+def set_task_awaiter(awaiter):
+    """Set the callable that resolves the awaitable returned by an async task.
+
+    The tracer calls ``awaiter(awaitable)`` in the thread that runs the
+    tracer, inside the task's request context, and uses its return value
+    as the task's return value.  Exceptions raised by it are handled as
+    exceptions raised by the task body.  It applies to all tracers,
+    including ones already built, and to eager execution with
+    :meth:`~celery.app.task.Task.apply`.
+
+    With no awaiter set (the default, or ``None``), the tracer returns the
+    awaitable as the task's return value without awaiting it.
+    """
+    global _task_awaiter
+    _task_awaiter = awaiter
+
+
+def get_task_awaiter():
+    """Return the callable set by :func:`set_task_awaiter`, or :const:`None`."""
+    return _task_awaiter
 
 
 def get_log_policy(task, einfo, exc):
@@ -354,6 +396,8 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
     # we optimize it away by simply calling the run method directly,
     # saving the extra method call and a line less in the stack trace.
     fun = task if task_has_custom(task, '__call__') else task.run
+    is_async = is_async_task(task)
+    isawaitable = inspect.isawaitable
 
     loader = loader or app.loader
     deduplicate_successful_tasks = ((app.conf.task_acks_late or task.acks_late)
@@ -562,6 +606,10 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
                         task_before_start(uuid, args, kwargs)
 
                     R = retval = fun(*args, **kwargs)
+                    if is_async:
+                        awaiter = _task_awaiter
+                        if awaiter is not None and isawaitable(R):
+                            R = retval = awaiter(R)
                     state = SUCCESS
                 except Reject as exc:
                     I, R = Info(REJECTED, exc), ExceptionInfo(internal=True)
@@ -880,6 +928,8 @@ def _install_stack_protection():
             if req and not req._protected and \
                     len(stack) == 1 and not req.called_directly:
                 req._protected = 1
+                # The tracer keeps the request pushed until an awaitable
+                # returned here has been resolved by the task awaiter.
                 return self.run(*args, **kwargs)
             return orig(self, *args, **kwargs)
         BaseTask.__call__ = __protected_call__

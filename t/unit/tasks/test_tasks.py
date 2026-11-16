@@ -2086,8 +2086,11 @@ class test_apply_task(TasksCase):
         task.iterations = 0
 
         free_vars = task.run.__code__.co_freevars
-        shared_retry_kwargs = task.run.__closure__[
-            free_vars.index("retry_kwargs")
+        retry_for = task.run.__closure__[
+            free_vars.index("retry_for")
+        ].cell_contents
+        shared_retry_kwargs = retry_for.__closure__[
+            retry_for.__code__.co_freevars.index("retry_kwargs")
         ].cell_contents
         assert shared_retry_kwargs == {'max_retries': 5}
 

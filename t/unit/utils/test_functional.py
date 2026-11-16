@@ -1,12 +1,14 @@
 import collections
+import functools
 import sys
+from unittest.mock import Mock
 
 import pytest
 from kombu.utils.functional import lazy
 
 from celery.utils.functional import (DummyContext, first, firstmethod, fun_accepts_kwargs, fun_takes_argument,
-                                     head_from_fun, is_numeric_value, lookahead, maybe_list, mlazy, padlist, regen,
-                                     seq_concat_item, seq_concat_seq)
+                                     head_from_fun, is_async_callable, is_numeric_value, lookahead, maybe_list,
+                                     mlazy, padlist, regen, seq_concat_item, seq_concat_seq)
 
 
 def test_DummyContext():
@@ -650,3 +652,43 @@ def test_is_numeric_value(value, expected):
     res = is_numeric_value(value)
     assert type(res) is type(expected)
     assert res == expected
+
+
+class test_is_async_callable:
+
+    async def coro_fun(self, x):
+        return x
+
+    def sync_fun(self, x):
+        return x
+
+    def test_coroutine_function(self):
+        assert is_async_callable(test_is_async_callable.coro_fun)
+        assert is_async_callable(self.coro_fun)
+        assert is_async_callable(functools.partial(self.coro_fun, 1))
+
+    def test_sync_function(self):
+        assert not is_async_callable(self.sync_fun)
+        assert not is_async_callable(Mock())
+        assert not is_async_callable(len)
+
+    def test_sync_wrapper_of_coroutine_function(self):
+        @functools.wraps(self.coro_fun)
+        def wrapper(*args, **kwargs):
+            return self.coro_fun(*args, **kwargs)
+
+        assert is_async_callable(wrapper)
+
+    def test_sync_wrapper_of_sync_function(self):
+        @functools.wraps(self.sync_fun)
+        def wrapper(*args, **kwargs):
+            return self.sync_fun(*args, **kwargs)
+
+        assert not is_async_callable(wrapper)
+
+    def test_wrapped_cycle(self):
+        def fun():
+            pass
+
+        fun.__wrapped__ = fun
+        assert not is_async_callable(fun)

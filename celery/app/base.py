@@ -221,18 +221,16 @@ def pydantic_wrapper(
             context={**context, 'celery_app': app, 'celery_task_name': task_name},
         )
 
-    @functools.wraps(task_fun)
-    def wrapper(*task_args, **task_kwargs):
+    def validate_arguments(task_args, task_kwargs):
         # Validate task parameters if type hinted as BaseModel
         bound_args = task_signature.bind(*task_args, **task_kwargs)
         for arg_name, arg_value in bound_args.arguments.items():
             arg_model = get_argument_model(arg_name, arg_value)
             if arg_model is not None:
                 bound_args.arguments[arg_name] = validate_argument(arg_model, arg_value)
+        return bound_args
 
-        # Call the task with (potentially) converted arguments
-        returned_value = task_fun(*bound_args.args, **bound_args.kwargs)
-
+    def dump_return_value(returned_value):
         # Dump Pydantic model if the returned value is an instance of pydantic.BaseModel *and* its
         # class matches the typehint
         if type_hints and 'return' in type_hints:
@@ -252,6 +250,23 @@ def pydantic_wrapper(
             return returned_value.model_dump(**dump_kwargs)
 
         return returned_value
+
+    if inspect.iscoroutinefunction(task_fun):
+
+        @functools.wraps(task_fun)
+        async def wrapper(*task_args, **task_kwargs):
+            bound_args = validate_arguments(task_args, task_kwargs)
+            # Call the task with (potentially) converted arguments
+            returned_value = await task_fun(*bound_args.args, **bound_args.kwargs)
+            return dump_return_value(returned_value)
+    else:
+
+        @functools.wraps(task_fun)
+        def wrapper(*task_args, **task_kwargs):
+            bound_args = validate_arguments(task_args, task_kwargs)
+            # Call the task with (potentially) converted arguments
+            returned_value = task_fun(*bound_args.args, **bound_args.kwargs)
+            return dump_return_value(returned_value)
 
     # Parameters that positional and keyword arguments bind to. Other arguments
     # go to *args or **kwargs, which the wrapper doesn't validate one by one.
