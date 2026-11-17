@@ -1259,6 +1259,11 @@ class test_TaskPool:
         assert kwargs['block_warning'] == 1.0
         assert kwargs['recycle_timeout'] == 30.0
         assert composite.num_processes == 7
+        initializer = kwargs['initializer']
+        assert initializer.func is aio.process_initializer
+        assert initializer.keywords == {
+            'process_kind': 'async', 'process_capacity': 3,
+        }
 
     def test_dispatch(self, composite):
         self.started(composite)
