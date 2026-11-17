@@ -114,6 +114,14 @@ async def wait_forever():
     await asyncio.sleep(60)
 
 
+async def report_cancel_reason():
+    assert aioworker.current_cancel_reason() is None
+    try:
+        await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        return aioworker.current_cancel_reason()
+
+
 async def raise_value_error():
     raise ValueError('boom')
 
@@ -250,6 +258,17 @@ class test_AsyncWorkloop:
         assert isinstance(results[1][1].exception, exc)
         if reason == 'terminate':
             assert results[1][1].exception.args == (signal.SIGTERM,)
+
+    def test_current_cancel_reason(self, worker):
+        assert aioworker.current_cancel_reason() is None
+        workloop, thread, _ = start_loop(worker)
+        worker.send_task(1, run_awaited, report_cancel_reason)
+        worker.outq.wait_for(lambda m: any(x[0] == ACK for x in m))
+        time.sleep(0.1)
+        worker.send_control(aioworker.CANCEL, 1, 'soft')
+        worker.send_sentinel()
+        thread.join(5)
+        assert readies(worker.outq.messages)[1] == (True, 'soft')
 
     @pytest.mark.parametrize('outcome', ['return', 'raise'])
     @pytest.mark.parametrize('reason,exc', [
@@ -1179,6 +1198,17 @@ class test_TaskPool:
         assert pool.task_semaphore is None
         assert pool.async_processes == 3
         assert pool.async_capacity == 1
+
+    def test_task_with_async_variant_runs_in_async_part(self, app):
+        async def avariant():
+            pass
+
+        def hybrid():
+            pass
+        hybrid.__celery_async__ = avariant
+        task = app.task(shared=False)(hybrid)
+        pool = aio.TaskPool(2, async_concurrency=1, app=app)
+        assert pool.is_async_task_name(task.name)
 
     def test_init_rejects_zero(self, app):
         with pytest.raises(ValueError):

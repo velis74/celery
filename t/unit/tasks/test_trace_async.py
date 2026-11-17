@@ -1,14 +1,15 @@
 import asyncio
 import functools
 import inspect
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
 from celery import states
 from celery.app.task import Task
-from celery.app.trace import (build_tracer, fast_trace_task, get_task_awaiter, is_async_task,
-                              reset_worker_optimizations, set_task_awaiter, setup_worker_optimizations)
+from celery.app.trace import (ASYNC_VARIANT_ATTR, build_tracer, fast_trace_task, get_async_variant, get_task_awaiter,
+                              is_async_task, reset_worker_optimizations, runs_in_async_process, set_task_awaiter,
+                              setup_worker_optimizations)
 from celery.exceptions import Ignore, Reject, Retry
 
 
@@ -475,3 +476,153 @@ class test_pydantic_async:
         assert not inspect.iscoroutinefunction(double.run)
         assert double({'value': 2}) == {'value': 4}
         assert double.apply(({'value': 3},)).get() == {'value': 6}
+
+
+def with_variant(fun, variant):
+    setattr(fun, ASYNC_VARIANT_ATTR, variant)
+    return fun
+
+
+@pytest.fixture
+def async_process():
+    with patch('celery.app.trace.current_process_kind', return_value='async'):
+        yield
+
+
+class test_async_variant:
+
+    def test_attribute_name(self):
+        assert ASYNC_VARIANT_ATTR == '__celery_async__'
+
+    def test_plain(self):
+        async def aadd(x, y):
+            return ('async', x + y)
+
+        @self.app.task(shared=False)
+        @functools.partial(with_variant, variant=aadd)
+        def add(x, y):
+            return ('sync', x + y)
+
+        assert get_async_variant(add) is aadd
+        assert runs_in_async_process(add)
+        assert not is_async_task(add)
+
+    def test_behind_wraps(self):
+        async def aadd(x, y):
+            return x + y
+
+        def add(x, y):
+            return x + y
+        with_variant(add, aadd)
+
+        @functools.wraps(add)
+        def wrapper(*args, **kwargs):
+            return add(*args, **kwargs)
+        del wrapper.__dict__[ASYNC_VARIANT_ATTR]
+
+        task = self.app.task(shared=False)(wrapper)
+        assert get_async_variant(task) is aadd
+
+    def test_none_without_attribute(self):
+        @self.app.task(shared=False)
+        def add(x, y):
+            return x + y
+        assert get_async_variant(add) is None
+        assert not runs_in_async_process(add)
+
+    def test_ignored_when_not_coroutine_function(self):
+        @self.app.task(shared=False)
+        @functools.partial(with_variant, variant=lambda x, y: x + y)
+        def add(x, y):
+            return x + y
+        assert get_async_variant(add) is None
+
+    def test_ignored_for_async_body(self):
+        async def other(x):
+            return x
+
+        @self.app.task(shared=False)
+        @functools.partial(with_variant, variant=other)
+        async def aecho(x):
+            return x
+        assert get_async_variant(aecho) is None
+        assert runs_in_async_process(aecho)
+
+    def test_found_with_worker_optimizations(self):
+        async def aadd(x, y):
+            return x + y
+
+        @self.app.task(shared=False)
+        @functools.partial(with_variant, variant=aadd)
+        def add(x, y):
+            return x + y
+
+        setup_worker_optimizations(self.app)
+        try:
+            assert get_async_variant(add) is aadd
+        finally:
+            reset_worker_optimizations(self.app)
+
+    def test_ignored_with_custom_call(self):
+        async def aecho(self, x):
+            return x
+
+        class CustomCall(Task):
+            def __call__(self, *args, **kwargs):
+                return self.run(*args, **kwargs)
+
+        @self.app.task(shared=False, base=CustomCall)
+        @functools.partial(with_variant, variant=aecho)
+        def echo(x):
+            return x
+        assert get_async_variant(echo) is None
+
+
+class test_trace_async_variant:
+
+    def setup_method(self):
+        async def aecho(x):
+            return ('async', x)
+
+        async def abound(task, x):
+            return ('async', task.request.id, x)
+
+        @self.app.task(shared=False)
+        @functools.partial(with_variant, variant=aecho)
+        def echo(x):
+            return ('sync', x)
+
+        @self.app.task(shared=False, bind=True)
+        @functools.partial(with_variant, variant=abound)
+        def bound(self, x):
+            return ('sync', self.request.id, x)
+
+        @self.app.task(shared=False, bind=True, autoretry_for=(KeyError,))
+        @functools.partial(with_variant, variant=abound)
+        def retrying(self, x):
+            return ('sync', self.request.id, x)
+
+        self.echo, self.bound, self.retrying = echo, bound, retrying
+
+    def test_async_process_awaits_variant(self, async_process, awaiter):
+        retval, info, _, _ = trace(self.app, self.echo, (1,), eager=False)
+        assert retval == ('async', 1)
+        assert len(awaiter.calls) == 1
+
+    @pytest.mark.parametrize('name', ['bound', 'retrying'])
+    def test_bound_variant_receives_task(self, async_process, awaiter, name):
+        task = getattr(self, name)
+        retval, *_ = trace(self.app, task, (2,), task_id='id-7', eager=False)
+        assert retval == ('async', 'id-7', 2)
+
+    def test_eager_runs_sync(self, async_process, awaiter):
+        retval, *_ = trace(self.app, self.echo, (3,), eager=True)
+        assert retval == ('sync', 3)
+        assert self.echo.apply((3,)).get() == ('sync', 3)
+        assert not awaiter.calls
+
+    def test_other_processes_run_sync(self, awaiter):
+        retval, *_ = trace(self.app, self.echo, (4,), eager=False)
+        assert retval == ('sync', 4)
+        assert self.echo(4) == ('sync', 4)
+        assert not awaiter.calls

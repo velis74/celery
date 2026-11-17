@@ -37,7 +37,7 @@ from .asynpool import Worker
 
 __all__ = (
     'AsyncWorker', 'AsyncWorkloop', 'CANCEL', 'STOP', 'RECYCLE_REQUEST',
-    'add_task_wrapper',
+    'add_task_wrapper', 'current_cancel_reason',
 )
 
 logger = get_logger(__name__)
@@ -80,6 +80,18 @@ def add_task_wrapper(wrapper):
     the pool starts apply in all its async processes.
     """
     _task_wrappers.append(wrapper)
+
+
+def current_cancel_reason():
+    """Return why the parent cancelled the job of the running task.
+
+    :const:`CANCEL_SOFT` after the soft time limit, :const:`CANCEL_HARD`
+    after the hard time limit, :const:`CANCEL_TERMINATE` after
+    ``revoke(terminate=True)``, and :const:`None` when the job is not
+    cancelled or the code does not run in a job of an async pool process.
+    """
+    entry = _current_job.get(None)
+    return entry.cancel_reason if entry is not None else None
 
 
 def _wrap(awaitable):
