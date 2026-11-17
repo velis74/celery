@@ -35,7 +35,10 @@ from celery.utils.log import get_logger
 
 from .asynpool import Worker
 
-__all__ = ('AsyncWorker', 'AsyncWorkloop', 'CANCEL', 'STOP', 'RECYCLE_REQUEST')
+__all__ = (
+    'AsyncWorker', 'AsyncWorkloop', 'CANCEL', 'STOP', 'RECYCLE_REQUEST',
+    'add_task_wrapper',
+)
 
 logger = get_logger(__name__)
 
@@ -63,6 +66,26 @@ _STOP = object()
 
 #: The job run by the tracer in the current thread.
 _current_job = contextvars.ContextVar('celery.concurrency.aioworker.job')
+
+#: Wrappers added with :func:`add_task_wrapper`.
+_task_wrappers = []
+
+
+def add_task_wrapper(wrapper):
+    """Run each task coroutine of the async pool processes as ``wrapper(coroutine)``.
+
+    ``wrapper`` returns an awaitable that awaits ``coroutine`` and returns
+    its result.  It runs on the event loop, in the context of the task.  The
+    wrapper added last is the outermost.  Wrappers added in the worker before
+    the pool starts apply in all its async processes.
+    """
+    _task_wrappers.append(wrapper)
+
+
+def _wrap(awaitable):
+    for wrapper in _task_wrappers:
+        awaitable = wrapper(awaitable)
+    return awaitable
 
 
 class _JobAborted(BaseException):
@@ -434,7 +457,7 @@ class AsyncWorkloop:
             done.set_exception(_cancel_exception(entry))
             return
         try:
-            task = asyncio.ensure_future(awaitable)
+            task = asyncio.ensure_future(_wrap(awaitable))
         except BaseException as exc:  # pylint: disable=broad-except
             done.set_exception(exc)
             return
