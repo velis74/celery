@@ -5,11 +5,11 @@ import signal
 import threading
 import time
 from struct import pack
-from unittest.mock import Mock, patch
+from unittest.mock import ANY, Mock, patch
 
 import pytest
 from billiard.exceptions import SoftTimeLimitExceeded, Terminated, TimeLimitExceeded
-from billiard.pool import ACK, EX_OK, READY, TASK, ApplyResult, MaybeEncodingError
+from billiard.pool import ACK, EX_OK, EX_RECYCLE, READY, TASK, ApplyResult, MaybeEncodingError
 from kombu.asynchronous import Hub
 from kombu.asynchronous.semaphore import LaxBoundedSemaphore
 
@@ -253,6 +253,7 @@ class test_AsyncWorkloop:
 
     @pytest.mark.parametrize('outcome', ['return', 'raise'])
     @pytest.mark.parametrize('reason,exc', [
+        ('hard', TimeLimitExceeded),
         ('terminate', Terminated),
     ])
     def test_aborted_job_ignores_handled_cancel(self, worker, reason, exc,
@@ -285,6 +286,53 @@ class test_AsyncWorkloop:
         result = readies(worker.outq.messages)[1]
         assert result[0] is False
         assert isinstance(result[1].exception, exc)
+
+    @pytest.mark.parametrize('reason', ['hard', 'terminate'])
+    def test_aborted_job_skips_tracer_state(self, worker, reason):
+        seen = []
+
+        def tracer():
+            try:
+                return run_awaited(wait_forever)
+            except Exception as exc:
+                seen.append(exc)
+                raise
+
+        workloop, thread, _ = start_loop(worker)
+        worker.send_task(1, tracer)
+        worker.outq.wait_for(lambda m: m)
+        time.sleep(0.1)
+        worker.send_control(aioworker.CANCEL, 1, reason, signal.SIGTERM)
+        worker.send_sentinel()
+        thread.join(5)
+        assert not seen
+        assert readies(worker.outq.messages)[1][0] is False
+
+    def test_stop_control_message(self, worker):
+        workloop, thread, result = start_loop(worker)
+        worker.send_task(1, run_awaited, sleep_and_return, 0.2, 'x')
+        worker.outq.wait_for(lambda m: m)
+        worker.send_control(aioworker.STOP)
+        thread.join(5)
+        assert not thread.is_alive()
+        assert result['exit'] == EX_RECYCLE
+        assert readies(worker.outq.messages) == {1: (True, 'x')}
+
+    def test_memory_limit_requests_recycling(self, worker):
+        worker.memory_limit = 1000
+        workloop, thread, _ = start_loop(worker)
+        with patch.object(aioworker, 'mem_rss', side_effect=[900, 1100, 1200]):
+            for job_id in range(3):
+                worker.send_task(job_id, run_awaited, sleep_and_return, 0, job_id)
+                worker.outq.wait_for(
+                    lambda m, j=job_id: any(x[0] == READY and x[1][0] == j for x in m))
+                time.sleep(0.05)
+            worker.send_sentinel()
+            thread.join(5)
+        requests = [m for m in worker.outq.messages
+                    if m[0] == aioworker.RECYCLE_REQUEST]
+        assert requests == [(aioworker.RECYCLE_REQUEST,
+                             (1234, 'max memory', 1100))]
 
     def test_cancel_before_awaiter_starts(self, worker):
         workloop, thread, _ = start_loop(worker)
@@ -463,7 +511,8 @@ class test_AsyncWorker:
     def test_reduce_keeps_options(self):
         w = self.make_worker()
         fun, args = w.__reduce__()
-        assert fun.keywords == {'capacity': 7, 'block_warning': 0.5}
+        assert fun.keywords == {'capacity': 7, 'block_warning': 0.5,
+                                'memory_limit': None}
         assert fun.func is aioworker.AsyncWorker
 
     def test_after_fork_ignores_soft_timeout_signal(self):
@@ -496,9 +545,19 @@ class FakeProc:
         self.inqW_fd = fd
         self.pid = pid
         self._aio_jobs = set()
+        self._aio_overdue = set()
+        self._aio_assigned = 0
+        self._aio_done = 0
+        self._aio_recycling = None
+        self._aio_replaced = False
+        self._aio_stop_sent = False
+        self._aio_kill_armed = False
+        self._aio_timers = []
         self.synq = Mock()
+        self.synq._reader.fileno.side_effect = OSError()
         self.synqW_fd = None
         self.alive = True
+        self.exitcode = None
 
     def _is_alive(self):
         return self.alive
@@ -518,7 +577,9 @@ class test_AsyncAsynPool:
     def test_init(self, apool):
         assert apool.capacity == 2
         assert apool.sched_strategy == aiopool.SCHED_STRATEGY_FAIR
-        assert apool.Worker.keywords == {'capacity': 2, 'block_warning': 1.0}
+        assert apool.Worker.keywords == {'capacity': 2, 'block_warning': 1.0,
+                                         'memory_limit': None}
+        assert apool.recycle_timeout == 30.0
         assert apool._timeout_handler.pool is apool
         assert all(q[2] is not None for q in apool._queues)
 
@@ -530,6 +591,7 @@ class test_AsyncAsynPool:
         assert pool.max_tasks_per_child == 10
         assert pool._maxtasksperchild is None
         assert pool._max_memory_per_child is None
+        assert pool.Worker.keywords['memory_limit'] == 1000
 
     def test_capacity_accounting(self, apool):
         proc = FakeProc(5)
@@ -612,6 +674,7 @@ class test_AsyncAsynPool:
         proc._aio_jobs = {1, 2}
         apool._job_procs = {1: proc, 2: FakeProc(6)}
         apool._control_backlog[proc] = ['x']
+
         hub.remove_writer = Mock()
         apool.on_process_down(proc)
         assert apool._job_procs == {2: apool._job_procs[2]}
@@ -654,6 +717,11 @@ class test_AsyncAsynPool:
             proc, jobs[1]._job, aioworker.CANCEL_TERMINATE, 15)
         apool.terminate_job(1, 15)  # unknown pid
         assert apool.owns_pid(4242) and not apool.owns_pid(1)
+        apool.send_cancel.reset_mock()
+        jobs[2].terminate(15)
+        jobs[2]._set(0, (True, 1))
+        apool._cancel_terminated(proc)
+        apool.send_cancel.assert_not_called()
 
     def test_terminate_job_without_hub(self, apool):
         proc = FakeProc(5, pid=4242)
@@ -748,19 +816,314 @@ class test_AsyncAsynPool:
         proc = FakeProc(5, pid=10)
         proc._aio_jobs = {1}
         apool._pool = [proc]
-        assert apool.process_info() == [{'pid': 10, 'in-flight': 1}]
+        assert apool.process_info() == [
+            {'pid': 10, 'in-flight': 1, 'done': 0, 'recycling': None}]
 
     def test_worker_process_tracks_jobs(self, apool):
         with patch('celery.concurrency.asynpool.AsynPool.WorkerProcess',
                    return_value=Mock()):
             proc = apool.WorkerProcess(Mock())
         assert proc._aio_jobs == set()
+        assert proc._aio_overdue == set()
+        assert proc._aio_recycling is None
 
     def test_register_with_event_loop_keeps_hub(self, apool):
         hub = get_hub()
         with patch('celery.concurrency.asynpool.AsynPool.register_with_event_loop'):
             apool.register_with_event_loop(hub)
         assert apool._hub is hub
+
+
+class test_AsyncAsynPool_recycling:
+
+    @pytest.fixture
+    def pool(self, apool):
+        apool._hub = Mock(name='hub')
+        apool.send_control = Mock()
+        apool._create_worker_process = Mock()
+        apool.on_grow = Mock()
+        apool._avail_index = Mock(return_value=1)
+        return apool
+
+    def add_proc(self, pool, fd=5, pid=4242):
+        proc = FakeProc(fd, pid=pid)
+        pool._pool = [proc]
+        pool._fileno_to_inq[fd] = proc
+        pool._all_inqueues.add(fd)
+        return proc
+
+    def schedule(self, pool, proc, *job_ids):
+        for job_id in job_ids:
+            pool._on_job_scheduled(proc, proc.inqW_fd, Mock(_job=job_id))
+
+    def test_hard_timeout(self, pool):
+        handler = pool._timeout_handler
+        pool.on_job_overdue = Mock()
+        job = Mock(_job=3, _timeout=5)
+        job.ready.return_value = True
+        handler.on_hard_timeout(job)
+        job._set.assert_not_called()
+        job.ready.return_value = False
+        handler.on_hard_timeout(job)
+        (job_id, (ok, einfo)), _ = job._set.call_args
+        assert job_id == 3 and ok is False
+        assert einfo.type is TimeLimitExceeded
+        job.handle_timeout.assert_called_once_with(soft=False)
+        pool.on_job_overdue.assert_called_once_with(3)
+        handler.pool = None
+        handler.on_hard_timeout(job)
+
+    def test_job_overdue_recycles(self, pool):
+        proc = self.add_proc(pool)
+        self.schedule(pool, proc, 1, 2)
+        pool.send_cancel = Mock()
+        pool.on_job_overdue(99)
+        pool.send_cancel.assert_not_called()
+        pool.on_job_overdue(1)
+        pool.send_cancel.assert_called_once_with(proc, 1, aioworker.CANCEL_HARD)
+        assert proc._aio_overdue == {1}
+        assert proc._aio_recycling == aiopool.RECYCLE_TIME_LIMIT
+        assert 5 not in pool._all_inqueues and 5 not in pool._busy_workers
+        assert pool._processes == 2 and proc._aio_replaced
+        pool.on_grow.assert_called_once_with(1)
+        pool._create_worker_process.assert_called_once_with(1)
+        pool._hub.call_later.assert_called_once_with(
+            30.0, pool._on_recycle_timeout, ANY)
+        # Recycling again does nothing.
+        pool.recycle(proc, aiopool.RECYCLE_MAX_TASKS)
+        assert pool._create_worker_process.call_count == 1
+        assert proc._aio_recycling == aiopool.RECYCLE_TIME_LIMIT
+
+    def test_recycle_when_not_running(self, pool):
+        proc = self.add_proc(pool)
+        pool._state = 2
+        pool.recycle_timeout = 0
+        pool.recycle(proc, 'x')
+        pool._create_worker_process.assert_not_called()
+        pool._hub.call_later.assert_not_called()
+        pool.recycle(FakeProc(6), 'x')  # not in the pool
+
+    def test_recycled_process_stops_when_empty(self, pool):
+        proc = self.add_proc(pool)
+        self.schedule(pool, proc, 1, 2)
+        pool.recycle(proc, 'x')
+        pool._maybe_stop(proc)
+        pool.on_job_ready(1, None, None, 5)
+        pool.send_control.assert_not_called()
+        pool.on_job_ready(2, None, None, 5)
+        pool.send_control.assert_called_once_with(proc, (aioworker.STOP,))
+        assert proc._aio_done == 2
+        pool._maybe_stop(proc)
+        pool.send_control.assert_called_once()
+        assert 5 not in pool._busy_workers
+
+    def test_only_overdue_jobs_left(self, pool):
+        proc = self.add_proc(pool)
+        self.schedule(pool, proc, 1, 2)
+        pool._kill = Mock()
+        pool.on_job_overdue(1)
+        pool._hub.call_later.reset_mock()
+        pool.on_job_ready(2, None, None, 5)
+        pool._hub.call_later.assert_called_once_with(
+            pool.overdue_grace, pool._on_overdue_grace, ANY)
+        pool._maybe_stop(proc)
+        pool._hub.call_later.assert_called_once()
+        proc_ref = pool._hub.call_later.call_args[0][2]
+        pool._on_overdue_grace(proc_ref)
+        pool._kill.assert_called_once_with(proc, ANY)
+        pool._on_overdue_grace(lambda: None)
+        proc._aio_jobs.clear()
+        pool._on_overdue_grace(proc_ref)
+        pool._kill.assert_called_once()
+
+    def test_only_overdue_jobs_without_hub(self, pool):
+        proc = self.add_proc(pool)
+        self.schedule(pool, proc, 1)
+        pool._kill = Mock()
+        pool._hub = None
+        pool.on_job_overdue(1)
+        pool._kill.assert_called_once_with(proc, ANY)
+
+    def test_recycle_timeout(self, pool):
+        proc = self.add_proc(pool)
+        pool._kill = Mock()
+        pool._on_recycle_timeout(lambda: None)
+        pool._on_recycle_timeout(lambda: FakeProc(9))
+        pool._kill.assert_not_called()
+        pool._on_recycle_timeout(lambda: proc)
+        pool._kill.assert_called_once_with(proc, ANY)
+
+    def test_kill(self, pool):
+        proc = self.add_proc(pool)
+        with patch.object(aiopool.os, 'kill') as kill:
+            pool._kill(FakeProc(9), 'x')
+            proc.alive = False
+            pool._kill(proc, 'x')
+            kill.assert_not_called()
+            proc.alive = True
+            pool._kill(proc, 'x')
+            kill.assert_called_once_with(4242, signal.SIGKILL)
+            assert proc._controlled_termination
+            kill.side_effect = ProcessLookupError()
+            pool._kill(proc, 'x')
+
+    def test_rescheduled_job_leaves_recycled_process(self, pool):
+        a = self.add_proc(pool)
+        b = FakeProc(6, pid=4343)
+        pool._fileno_to_inq[6] = b
+        job = Mock(_job=1)
+        pool._on_job_scheduled(a, 5, job)
+        pool.recycle(a, 'x')
+        pool._on_job_scheduled(b, 6, job)
+        pool.send_control.assert_called_once_with(a, (aioworker.STOP,))
+
+    def test_flush_stops_emptied_recycled_process(self, pool):
+        proc = self.add_proc(pool)
+        pool.maintain_pool = Mock()
+        unwritten = ApplyResult(pool._cache, None)
+        pool._on_job_scheduled(proc, 5, unwritten)
+        pool.recycle(proc, 'x')
+        pool.flush()
+        pool.send_control.assert_called_once_with(proc, (aioworker.STOP,))
+
+    def test_max_tasks_per_child(self, pool):
+        pool.max_tasks_per_child = 3
+        proc = self.add_proc(pool)
+        self.schedule(pool, proc, 1, 2)
+        assert not proc._aio_recycling
+        self.schedule(pool, proc, 3)
+        assert proc._aio_recycling == aiopool.RECYCLE_MAX_TASKS
+
+    def test_recycle_request(self, pool):
+        proc = self.add_proc(pool)
+        pool.recycle = Mock()
+        pool.on_recycle_request(1, aiopool.RECYCLE_MAX_MEMORY, 10)
+        pool.recycle.assert_not_called()
+        with patch.object(aiopool, 'logger') as logger:
+            pool.on_recycle_request(4242, aiopool.RECYCLE_MAX_MEMORY, 10)
+        logger.warning.assert_called_once()
+        pool.recycle.assert_called_once_with(proc, aiopool.RECYCLE_MAX_MEMORY)
+
+    def test_result_handler_takes_recycle_requests(self, pool):
+        handler = pool.create_result_handler()
+        assert handler.state_handlers[aioworker.RECYCLE_REQUEST] == pool.on_recycle_request
+
+    def test_process_alive_while_recycling(self, pool):
+        proc = self.add_proc(pool)
+        pool._fileno_to_inq.clear()
+        pool._all_inqueues.clear()
+        proc._aio_recycling = 'x'
+        pool.on_process_alive(4242)
+        assert 5 in pool._fileno_to_inq
+        assert 5 not in pool._all_inqueues
+        with patch.object(aiopool.logger, 'warning'):
+            pool.on_process_alive(1)
+
+    def test_process_down_after_recycling(self, pool):
+        proc = self.add_proc(pool)
+        tref = Mock()
+        proc._aio_timers = [tref]
+        proc._aio_recycling = 'x'
+        proc._aio_replaced = True
+        proc.exitcode = -9
+        pool._processes = 2
+        pipe = Pipe()
+        try:
+            os.write(pipe.w, b'stale')
+            proc.synq = Mock()
+            proc.synq._reader.fileno.return_value = pipe.r
+            pool._forget_process(proc)
+            assert os.get_blocking(pipe.r)
+            os.set_blocking(pipe.r, False)
+            with pytest.raises(BlockingIOError):
+                os.read(pipe.r, 10)
+        finally:
+            pipe.close()
+        tref.cancel.assert_called_once_with()
+        assert pool._processes == 1
+        assert pool._recycled_exitcodes == [-9]
+        pool._forget_process(proc)
+        assert pool._processes == 1
+
+    def test_drain_closed_pipe(self):
+        conn = Mock()
+        conn.fileno.side_effect = ValueError()
+        aiopool._drain(conn)
+        pipe = Pipe()
+        pipe.close()
+        conn.fileno.side_effect = None
+        conn.fileno.return_value = pipe.r
+        aiopool._drain(conn)
+
+    def test_recycled_exits_do_not_count(self, pool):
+        def join(shutdown=False):
+            pool._recycled_exitcodes.extend([-9, 0])
+            return [0, -9, 1]
+        with patch('celery.concurrency.asynpool.AsynPool._join_exited_workers',
+                   side_effect=join):
+            assert pool._join_exited_workers() == [1]
+        assert pool._recycled_exitcodes == []
+
+        def join_unknown(shutdown=False):
+            pool._recycled_exitcodes.append(-15)
+            return []
+        with patch('celery.concurrency.asynpool.AsynPool._join_exited_workers',
+                   side_effect=join_unknown):
+            assert pool._join_exited_workers() == []
+
+    def test_recycled_exits_skip_restart_limit(self, pool):
+        pool.restart_state = Mock()
+        pool._processes = 1
+        pool._pool = []
+        pool._join_exited_workers = Mock(return_value=[EX_RECYCLE])
+        pool._maintain_pool()
+        pool.restart_state.step.assert_not_called()
+        pool._pool = []
+        pool._join_exited_workers = Mock(return_value=[-9])
+        pool._maintain_pool()
+        pool.restart_state.step.assert_called_once_with()
+
+    def test_process_exit_retries_reaping(self, pool):
+        proc = self.add_proc(pool)
+        hub = Mock(name='hub')
+        with patch('celery.concurrency.asynpool.AsynPool._event_process_exit') as exit_:
+            pool._event_process_exit(hub, proc)
+            exit_.assert_called_once_with(hub, proc)
+        hub.call_later.assert_called_once_with(
+            pool.reap_interval, pool._reap, hub, ANY, 1)
+        proc_ref = hub.call_later.call_args[0][3]
+        assert proc_ref() is proc
+        hub.call_later.reset_mock()
+        pool._pool = []
+        with patch('celery.concurrency.asynpool.AsynPool._event_process_exit'):
+            pool._event_process_exit(hub, proc)
+        hub.call_later.assert_not_called()
+
+    def test_reap(self, pool):
+        proc = self.add_proc(pool)
+        hub = Mock(name='hub')
+        pool.maintain_pool = Mock()
+        pool._reap(hub, lambda: None, 1)
+        pool.maintain_pool.assert_not_called()
+        pool._reap(hub, lambda: proc, 1)
+        pool.maintain_pool.assert_called_once_with()
+        hub.call_later.assert_called_once_with(
+            pool.reap_interval, pool._reap, hub, ANY, 2)
+        hub.call_later.reset_mock()
+        pool._reap(hub, lambda: proc, pool.reap_attempts)
+        hub.call_later.assert_not_called()
+        pool._pool = []
+        pool.maintain_pool.reset_mock()
+        pool._reap(hub, lambda: proc, 1)
+        pool.maintain_pool.assert_not_called()
+
+    def test_update_busy_skips_recycling(self, pool):
+        proc = self.add_proc(pool)
+        proc._aio_jobs = {1, 2}
+        pool._busy_workers.add(5)
+        proc._aio_recycling = 'x'
+        pool._update_busy(proc)
+        assert 5 not in pool._busy_workers
 
 
 @pytest.fixture
@@ -870,6 +1233,7 @@ class test_TaskPool:
         assert kwargs['capacity'] == 3
         assert kwargs['semaphore'] is composite._async_semaphore
         assert kwargs['block_warning'] == 1.0
+        assert kwargs['recycle_timeout'] == 30.0
         assert composite.num_processes == 7
 
     def test_dispatch(self, composite):
@@ -957,5 +1321,6 @@ class test_TaskPool:
         assert info['async-concurrency'] == 5
         assert info['async-processes'] == [{'pid': 1}]
         assert info['max-concurrency'] == 2
+        assert info['free-slots'] == {'sync': 2, 'async': 5}
         composite._async = None
         assert composite._get_info()['async-processes'] == []
