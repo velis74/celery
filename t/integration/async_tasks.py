@@ -4,6 +4,7 @@ The broker, the result backend and the async pool settings are read from
 the environment, so the worker process and the tests use the same app.
 """
 import asyncio
+import functools
 import os
 import signal
 import time
@@ -146,3 +147,104 @@ async def aprocess_init_values():
     await asyncio.sleep(0)
     return [PROCESS_INIT_VALUES.get(os.getpid()),
             [current_process_kind(), current_process_capacity()]]
+
+
+# Sync tasks with an async implementation in ``__celery_async__``.
+
+def _hybrid(seconds=0):
+    time.sleep(seconds)
+    return ['sync', current_process_kind()]
+
+
+async def _ahybrid(seconds=0):
+    await asyncio.sleep(seconds)
+    return ['async', current_process_kind()]
+
+
+_hybrid.__celery_async__ = _ahybrid
+hybrid = app.task(name='async_tasks.hybrid')(_hybrid)
+
+
+def _hybrid_bound(self, seconds):
+    time.sleep(seconds)
+    return ['sync', self.request.id]
+
+
+async def _ahybrid_bound(self, seconds):
+    await asyncio.sleep(seconds)
+    return ['async', self.request.id]
+
+
+_hybrid_bound.__celery_async__ = _ahybrid_bound
+hybrid_bound = app.task(bind=True, name='async_tasks.hybrid_bound')(
+    _hybrid_bound)
+
+
+def _hybrid_soft(seconds):
+    return 'sync'
+
+
+async def _ahybrid_soft(seconds):
+    try:
+        await asyncio.sleep(seconds)
+    except asyncio.CancelledError:
+        return 'soft limit'
+    return 'not reached'
+
+
+_hybrid_soft.__celery_async__ = _ahybrid_soft
+hybrid_soft = app.task(soft_time_limit=0.5, name='async_tasks.hybrid_soft')(
+    _hybrid_soft)
+
+
+def _hybrid_soft_fail(seconds):
+    return 'sync'
+
+
+async def _ahybrid_soft_fail(seconds):
+    await asyncio.sleep(seconds)
+    return 'not reached'
+
+
+_hybrid_soft_fail.__celery_async__ = _ahybrid_soft_fail
+hybrid_soft_fail = app.task(
+    soft_time_limit=0.5, name='async_tasks.hybrid_soft_fail')(
+    _hybrid_soft_fail)
+
+
+def _hybrid_hard(seconds):
+    return 'sync'
+
+
+async def _ahybrid_hard(seconds):
+    """Ignore cancellation until ``seconds`` have passed."""
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        try:
+            await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            pass
+    return 'not reached'
+
+
+_hybrid_hard.__celery_async__ = _ahybrid_hard
+hybrid_hard = app.task(time_limit=1, name='async_tasks.hybrid_hard')(
+    _hybrid_hard)
+
+
+def _wrapped_target():
+    return ['sync', current_process_kind()]
+
+
+async def _awrapped_target():
+    await asyncio.sleep(0)
+    return ['async', current_process_kind()]
+
+
+_wrapped_target.__celery_async__ = _awrapped_target
+
+
+@app.task(name='async_tasks.wrapped')
+@functools.wraps(_wrapped_target)
+def wrapped():
+    return _wrapped_target()

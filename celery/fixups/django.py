@@ -13,7 +13,7 @@ from kombu.utils.imports import symbol_by_name
 from kombu.utils.objects import cached_property
 
 from celery import _state, signals
-from celery.app.trace import get_task_awaiter, is_async_task
+from celery.app.trace import get_task_awaiter, runs_in_async_process
 from celery.exceptions import FixupWarning, ImproperlyConfigured
 from celery.local import Proxy
 from celery.utils.log import get_logger
@@ -66,8 +66,8 @@ def _in_event_loop() -> bool:
 
 
 def _is_coroutine_task(task: Any) -> bool:
-    """Return true if the body of *task* is a coroutine function."""
-    return is_async_task(task)
+    """Return true if *task* runs on the event loop of an async process."""
+    return runs_in_async_process(task)
 
 
 def _verify_django_version(django: "ModuleType") -> None:

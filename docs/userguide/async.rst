@@ -133,6 +133,70 @@ the result, which fails with the JSON serializer
 unless an awaiter is installed with
 :func:`celery.app.trace.set_task_awaiter`.
 
+.. _async-variant:
+
+A task with an async implementation
+===================================
+
+An ``async def`` task runs only on a worker with
+:option:`--aconcurrency <celery worker --aconcurrency>`. A library that
+defines tasks does not know which Celery it runs on, nor how the worker is
+started. It registers a sync task and attaches an async implementation to
+its function in the attribute ``__celery_async__``
+(:data:`celery.app.trace.ASYNC_VARIANT_ATTR`). Celery without async
+processes, upstream Celery included, ignores the attribute and runs the sync
+function. A worker with async processes runs the task in an async process
+and awaits the async implementation instead.
+
+.. code-block:: python
+
+    import functools
+
+    import httpx
+    import requests
+
+
+    async def fetch_async(url):
+        async with httpx.AsyncClient() as client:
+            return (await client.get(url)).status_code
+
+
+    def fetch(url):
+        return requests.get(url).status_code
+
+
+    # The literal name: the constant does not exist in upstream Celery.
+    fetch.__celery_async__ = fetch_async
+
+
+    def logged(fun):
+        @functools.wraps(fun)  # copies __celery_async__ too
+        def wrapper(*args, **kwargs):
+            return fun(*args, **kwargs)
+        return wrapper
+
+
+    fetch_task = app.task(logged(fetch))
+
+- The async implementation is a coroutine function with the signature of the
+  sync function. With ``bind=True`` it receives the task as the first
+  argument.
+- Celery reads the attribute from the task's ``run`` method and from the
+  functions it wraps (``__wrapped__``). It is ignored when the body is an
+  ``async def`` function, when the task class has a custom ``__call__``, and
+  when the value is not a coroutine function.
+- In an async process, the async implementation runs as the body of an
+  ``async def`` task: ``self.request``, :meth:`~@Task.retry`,
+  :meth:`~@Task.update_state`, signals, the result, time limits and
+  cancellation behave as described in :ref:`async-execution`, and
+  :func:`~celery.concurrency.current_process_kind` returns ``'async'``.
+  ``autoretry_for`` and the pydantic argument options apply to the sync
+  function only.
+- On a worker without async processes, and in the solo, threads, eventlet and
+  gevent pools, the sync function runs.
+- :meth:`~@Task.apply`, :setting:`task_always_eager` and calling the task
+  directly run the sync function.
+
 .. _async-starting:
 
 Starting the worker
@@ -303,6 +367,10 @@ Hard time limit
     ``REVOKED``. No signal is sent to the process; the ``signal`` argument
     is only reported as ``signum`` in the ``task-revoked`` event. Other tasks
     of the process are not affected.
+
+:func:`celery.concurrency.aioworker.current_cancel_reason` returns
+``'soft'``, ``'hard'`` or ``'terminate'`` in a coroutine cancelled for one
+of these reasons, and :const:`None` otherwise.
 
 A coroutine that suppresses cancellation keeps running and keeps its slot
 until it returns or exceeds the hard time limit. After the hard time limit
