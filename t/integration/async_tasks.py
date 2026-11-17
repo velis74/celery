@@ -248,3 +248,22 @@ _wrapped_target.__celery_async__ = _awrapped_target
 @functools.wraps(_wrapped_target)
 def wrapped():
     return _wrapped_target()
+
+
+# The pattern of docs/userguide/async.rst, "A task with an async implementation".
+
+def async_task_body(body):
+    """Return a sync task function for the ``async def`` function ``body``."""
+    @functools.wraps(body)
+    def run(*args, **kwargs):
+        return asyncio.run(body(*args, **kwargs))
+
+    run.__celery_async__ = body
+    return run
+
+
+@app.task(bind=True, name='async_tasks.async_body')
+@async_task_body
+async def async_body(self, seconds):
+    await asyncio.sleep(seconds)
+    return [self.request.id, current_process_kind()]
