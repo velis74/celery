@@ -22,7 +22,8 @@ Requirements
 ============
 
 - Python 3.10 or later, Celery from this repository with the ``redis``
-  extra (``pip install -e '.[redis]'`` in the repository root).
+  extra (``pip install -e '.[redis]'`` in the repository root, or one of the
+  git installations in ``README.rst`` of the repository root).
 - A Redis server or a RabbitMQ broker, and a Redis result backend.
 
 The broker and the result backend are read from the environment:
