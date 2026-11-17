@@ -10,7 +10,7 @@ from functools import partial
 
 from kombu.asynchronous.semaphore import LaxBoundedSemaphore
 
-from celery.app.trace import is_async_task
+from celery.app.trace import runs_in_async_process
 from celery.concurrency import ASYNC
 from celery.utils.functional import noop
 
@@ -106,7 +106,7 @@ class TaskPool(prefork.TaskPool):
         except TypeError:  # not hashable, so not a task name
             return False
         task = self.app.tasks.get(name) if self.app is not None else None
-        is_async = task is not None and is_async_task(task)
+        is_async = task is not None and runs_in_async_process(task)
         self._is_async_name[name] = is_async
         return is_async
 

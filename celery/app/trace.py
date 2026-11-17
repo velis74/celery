@@ -9,6 +9,7 @@ import os
 import sys
 import time
 from collections import namedtuple
+from functools import partial
 from warnings import warn
 
 from billiard.einfo import ExceptionInfo, ExceptionWithTraceback
@@ -22,6 +23,7 @@ from celery._state import _task_stack
 from celery.app.task import Context
 from celery.app.task import Task as BaseTask
 from celery.app.task import get_actual_ignore_result
+from celery.concurrency import ASYNC, current_process_kind
 from celery.exceptions import BackendGetMetaError, Ignore, InvalidTaskError, Reject, Retry
 from celery.result import AsyncResult
 from celery.utils.functional import is_async_callable
@@ -47,9 +49,13 @@ __all__ = (
     'TraceInfo', 'build_tracer', 'trace_task',
     'setup_worker_optimizations', 'reset_worker_optimizations',
     'is_async_task', 'get_task_awaiter', 'set_task_awaiter',
+    'ASYNC_VARIANT_ATTR', 'get_async_variant', 'runs_in_async_process',
 )
 
 from celery.worker.state import successful_requests
+
+#: Attribute of a sync task function holding its async implementation.
+ASYNC_VARIANT_ATTR = '__celery_async__'
 
 logger = get_logger(__name__)
 
@@ -153,6 +159,41 @@ def is_async_task(task):
         return True
     return bool(task_has_custom(task, '__call__')) and \
         is_async_callable(type(task).__call__)
+
+
+def get_async_variant(task):
+    """Return the async implementation attached to the sync body of ``task``.
+
+    The implementation is the coroutine function in the
+    :data:`ASYNC_VARIANT_ATTR` attribute of the task's ``run`` method, or of
+    a function it wraps (``__wrapped__``).  Returns :const:`None` when there
+    is none, when the value is not a coroutine function, when ``run`` is
+    itself a coroutine function, or when the task has a custom ``__call__``.
+    """
+    run = task.run
+    # The stack protection of the worker replaces BaseTask.__call__ from
+    # this module; it is not a custom __call__.
+    custom_call = mro_lookup(task.__class__, '__call__', stop={BaseTask, object},
+                             monkey_patched=['celery.app.task', __name__])
+    if inspect.iscoroutinefunction(run) or custom_call:
+        return None
+    fun, seen = run, set()
+    while fun is not None and id(fun) not in seen:
+        seen.add(id(fun))
+        variant = getattr(fun, ASYNC_VARIANT_ATTR, None)
+        if variant is not None:
+            return variant if inspect.iscoroutinefunction(variant) else None
+        fun = getattr(fun, '__wrapped__', None)
+    return None
+
+
+def runs_in_async_process(task):
+    """Return true if a worker with async processes runs ``task`` in one.
+
+    True for an ``async def`` task and for a task with an async
+    implementation (:func:`get_async_variant`).
+    """
+    return is_async_task(task) or get_async_variant(task) is not None
 
 
 def set_task_awaiter(awaiter):
@@ -397,6 +438,15 @@ def build_tracer(name, task, loader=None, hostname=None, store_errors=True,
     # saving the extra method call and a line less in the stack trace.
     fun = task if task_has_custom(task, '__call__') else task.run
     is_async = is_async_task(task)
+    if not eager and current_process_kind() == ASYNC:
+        variant = get_async_variant(task)
+        if variant is not None:
+            # A bound task passes itself as the first argument; the
+            # autoretry wrapper replaces a bound run with a plain function.
+            bound = not isinstance(
+                inspect.getattr_static(task.__class__, 'run', None), staticmethod)
+            fun = partial(variant, task) if bound else variant
+            is_async = True
     isawaitable = inspect.isawaitable
 
     loader = loader or app.loader
