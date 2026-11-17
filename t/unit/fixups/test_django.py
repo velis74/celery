@@ -384,6 +384,15 @@ class test_is_coroutine_task:
             return x + y
         assert _is_coroutine_task(add)
 
+    def test_task_with_async_variant(self):
+        async def aadd(x, y):
+            return x + y
+
+        def add(x, y):
+            return x + y
+        add.__celery_async__ = aadd
+        assert _is_coroutine_task(self.app.task(shared=False)(add))
+
     def test_async_bound_task(self):
         @self.app.task(shared=False, bind=True)
         async def add(self, x, y):
