@@ -1348,3 +1348,115 @@ class test_TaskPool:
         assert info['free-slots'] == {'sync': 2, 'async': 5}
         composite._async = None
         assert composite._get_info()['async-processes'] == []
+
+
+class test_edge_cases:
+
+    def test_frame_reader_retries_after_interrupt(self):
+        reads = [InterruptedError(), frame(('A', 1)), BlockingIOError()]
+        with patch.object(aioworker.os, 'read', side_effect=reads):
+            assert aioworker.FrameReader(5).read() == [('A', 1)]
+
+    def test_unpicklable_result_report_fails(self):
+        outq = Mock()
+        outq.put.side_effect = TypeError('cannot pickle')
+        with patch.object(aioworker, 'logger') as logger:
+            aioworker.OutqueueWriter(outq).write(
+                (READY, (1, None, (True, object()), 5)))
+        assert outq.put.call_count == 2
+        logger.error.assert_called_once()
+        assert logger.error.call_args[0][0].startswith('Cannot send result')
+
+    def make_workloop(self, worker):
+        workloop = aioworker.AsyncWorkloop(worker, pid=1234)
+        workloop.loop = Mock(name='loop')
+        return workloop
+
+    def test_bad_descriptor_stops_accepting(self, worker):
+        workloop = self.make_workloop(worker)
+        workloop._readers = [3]
+        reader = Mock(fd=3)
+        reader.read.side_effect = OSError(aioworker.errno.EBADF, 'closed')
+        callback = Mock()
+        workloop._on_readable(reader, callback)
+        workloop.loop.remove_reader.assert_called_once_with(3)
+        workloop.loop.stop.assert_called_once_with()
+        assert not workloop.accepting
+        callback.assert_not_called()
+
+    def test_other_read_errors_propagate(self, worker):
+        workloop = self.make_workloop(worker)
+        reader = Mock(fd=3)
+        reader.read.side_effect = OSError(aioworker.errno.EIO, 'io')
+        with pytest.raises(OSError):
+            workloop._on_readable(reader, Mock())
+        assert workloop.accepting
+
+    def test_job_ends_after_loop_closed(self, worker):
+        workloop = self.make_workloop(worker)
+        workloop.writer = Mock(name='writer')
+        workloop.loop.call_soon_threadsafe.side_effect = RuntimeError('closed')
+        workloop.run_job(aioworker._Job(1, 0), lambda: 42, (), {})
+        workloop.writer.put.assert_called_once_with(
+            (READY, (1, 0, (True, 42), worker.inqW_fd)))
+
+    def test_start_after_waiter_cancelled(self, worker):
+        workloop = self.make_workloop(worker)
+        coro = sleep_and_return(0, 1)
+        done = aioworker.concurrent.futures.Future()
+        done.cancel()
+        workloop._start(coro, None, done)
+        assert coro.cr_frame is None  # closed, never awaited
+
+    def test_start_with_non_awaitable(self, worker):
+        workloop = self.make_workloop(worker)
+        done = aioworker.concurrent.futures.Future()
+        workloop._start(42, aioworker._Job(1, 0), done)
+        assert isinstance(done.exception(), TypeError)
+
+    def test_cancel_exception_without_job(self):
+        exc = aioworker._cancel_exception(None)
+        assert isinstance(exc, aioworker.concurrent.futures.CancelledError)
+
+    def test_after_fork_without_synq_or_sigusr1(self):
+        w = aioworker.AsyncWorker(Mock(), Mock(), None, capacity=2)
+        with patch('billiard.pool.Worker.after_fork'), \
+                patch.object(aioworker, 'signal') as sig:
+            del sig.SIGUSR1
+            w.after_fork()
+        sig.signal.assert_not_called()
+
+    def test_workloop_uses_own_pid(self):
+        w = aioworker.AsyncWorker(Mock(), Mock(), None)
+        with patch.object(w, 'Workloop') as Workloop:
+            w.workloop()
+        Workloop.assert_called_once_with(w, os.getpid())
+
+    def test_update_busy_at_capacity(self, apool):
+        proc = FakeProc(5)
+        apool._fileno_to_inq[5] = proc
+        proc._aio_jobs = {1, 2}
+        apool._update_busy(proc)
+        assert 5 in apool._busy_workers
+        proc._aio_jobs = {1}
+        apool._update_busy(proc)
+        assert 5 not in apool._busy_workers
+
+    def test_write_control_retries_after_interrupt(self, apool):
+        proc = FakeProc(5)
+        proc.synqW_fd = 99
+        backlog = aiopool.deque([b'ab'])
+        with patch.object(aiopool.os, 'write',
+                          side_effect=[InterruptedError(), 2]):
+            assert apool._write_control(proc, backlog)
+        assert not backlog
+
+    def test_drain_keeps_going_when_restore_fails(self):
+        conn = Mock()
+        conn.fileno.return_value = 99
+        with patch.object(aiopool.os, 'get_blocking', return_value=True), \
+                patch.object(aiopool.os, 'set_blocking',
+                             side_effect=[None, OSError()]) as set_blocking, \
+                patch.object(aiopool.os, 'read', side_effect=[b'x', b'']):
+            aiopool._drain(conn)
+        assert set_blocking.call_count == 2
