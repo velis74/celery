@@ -2,7 +2,7 @@
 
 |build-status| |coverage| |license| |wheel| |semgrep| |pyversion| |pyimp| |ocbackerbadge| |ocsponsorbadge|
 
-:Version: 5.7.0+velis1 (Collider)
+:Version: 5.7.0+async (Collider)
 :Web: https://docs.celeryq.dev/en/stable/index.html
 :Download: https://pypi.org/project/celery/
 :Source: https://github.com/celery/celery/
@@ -17,7 +17,7 @@ This repository (``velis74/celery``, branch ``async-worker``) is Celery 5.7.0
 with native ``async def`` tasks: a worker started with ``--aconcurrency``
 runs them on asyncio event loops in child processes of their own (see
 ``docs/userguide/async.rst``). Without ``--aconcurrency`` the worker behaves
-as Celery 5.7.0. The package version is ``5.7.0+velis1``; the settings the
+as Celery 5.7.0. The package version is ``5.7.0+async``; the settings the
 fork adds are documented as new in 5.8.
 
 The fork is not published on PyPI. Install it from git:
@@ -30,23 +30,24 @@ uv, in ``pyproject.toml``:
     dependencies = ["celery[redis]"]
 
     [tool.uv.sources]
-    celery = { git = "https://github.com/velis74/celery", branch = "async-worker" }
+    celery = { git = "https://github.com/velis74/celery", tag = "v5.7.0+async" }
 
 pip, with a PEP 508 direct reference (also usable in a requirements file):
 
 .. code-block:: console
 
-    $ pip install "celery[redis] @ git+https://github.com/velis74/celery@async-worker"
+    $ pip install "celery[redis] @ git+https://github.com/velis74/celery@v5.7.0+async"
 
 Poetry, in ``pyproject.toml``:
 
 .. code-block:: toml
 
     [tool.poetry.dependencies]
-    celery = { git = "https://github.com/velis74/celery", branch = "async-worker", extras = ["redis"] }
+    celery = { git = "https://github.com/velis74/celery", tag = "v5.7.0+async", extras = ["redis"] }
 
-Use ``rev = "<commit>"`` (uv, Poetry) or ``@<commit>`` (pip) in place of the
-branch to pin a commit.
+The tag ``v5.7.0+async`` marks this version; branch ``async-worker`` has the
+latest changes on top of Celery 5.7.0 (``branch = "async-worker"`` in uv and
+Poetry, ``@async-worker`` with pip).
 
 Donations
 =========
