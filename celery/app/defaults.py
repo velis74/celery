@@ -334,6 +334,7 @@ NAMESPACES = Namespace(
         async_block_warning=Option(1.0, type='float'),
         async_concurrency=Option(0, type='int'),
         async_processes=Option(1, type='int'),
+        async_recycle_timeout=Option(30.0, type='float'),
         autoscaler=Option('celery.worker.autoscale:Autoscaler'),
         cancel_long_running_tasks_on_connection_loss=Option(
             False, type='bool'

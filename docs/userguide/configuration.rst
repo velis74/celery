@@ -3777,6 +3777,25 @@ warning with the current stack of its event loop thread when the loop has not
 run any callback. The warning is logged once per blocking period. 0 disables
 the check; the smallest threshold is 0.04, and smaller values are raised to it.
 
+.. setting:: worker_async_recycle_timeout
+
+``worker_async_recycle_timeout``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. versionadded:: 5.8
+
+Default: 30.0.
+
+Seconds a child process running ``async def`` tasks may take to finish its
+tasks once it is recycled, before it is killed. A process is recycled when one
+of its tasks exceeds the hard time limit, after
+:setting:`worker_max_tasks_per_child` tasks, and when its resident memory
+exceeds :setting:`worker_max_memory_per_child`. A recycled process gets no new
+tasks, and a replacement process starts at once. Tasks still running when the
+process is killed fail with :exc:`~celery.exceptions.WorkerLostError`.
+0 disables the timeout: the process is then killed only when all its remaining
+tasks have exceeded the hard time limit.
+
 .. setting:: worker_prefetch_multiplier
 
 ``worker_prefetch_multiplier``

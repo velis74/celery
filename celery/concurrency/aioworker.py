@@ -25,16 +25,17 @@ from functools import partial
 from struct import unpack_from
 from time import monotonic
 
+from billiard.compat import mem_rss
 from billiard.einfo import ExceptionInfo
 from billiard.exceptions import SoftTimeLimitExceeded, Terminated, TimeLimitExceeded
-from billiard.pool import ACK, EX_OK, READY, TASK, MaybeEncodingError
+from billiard.pool import ACK, EX_OK, EX_RECYCLE, READY, TASK, MaybeEncodingError
 
 from celery.app.trace import get_task_awaiter, set_task_awaiter
 from celery.utils.log import get_logger
 
 from .asynpool import Worker
 
-__all__ = ('AsyncWorker', 'AsyncWorkloop', 'CANCEL')
+__all__ = ('AsyncWorker', 'AsyncWorkloop', 'CANCEL', 'STOP', 'RECYCLE_REQUEST')
 
 logger = get_logger(__name__)
 
@@ -45,6 +46,12 @@ CANCEL = 'CANCEL'
 CANCEL_SOFT = 'soft'
 CANCEL_HARD = 'hard'
 CANCEL_TERMINATE = 'terminate'
+
+#: Control message ``(STOP,)``: finish the running jobs and exit.
+STOP = 'STOP'
+
+#: Message ``(RECYCLE_REQUEST, (pid, reason, detail))`` to the parent.
+RECYCLE_REQUEST = 16
 
 #: Smallest :setting:`worker_async_block_warning` threshold, in seconds.
 MIN_BLOCK_WARNING = 0.04
@@ -58,16 +65,17 @@ _STOP = object()
 _current_job = contextvars.ContextVar('celery.concurrency.aioworker.job')
 
 
-class _JobTerminated(BaseException):
-    """Raised in the tracer thread of a job cancelled by ``revoke(terminate=True)``.
+class _JobAborted(BaseException):
+    """Raised in the tracer thread of a job the parent has already ended.
 
-    Derives from :exc:`BaseException`, so the tracer does not store a state
-    for the job.
+    Used for ``revoke(terminate=True)`` and the hard time limit.  Derives
+    from :exc:`BaseException`, so the tracer does not store a state for the
+    job; ``exc`` is the job's result sent to the parent.
     """
 
-    def __init__(self, signum):
-        super().__init__(signum)
-        self.signum = signum
+    def __init__(self, exc):
+        super().__init__(exc)
+        self.exc = exc
 
 
 class FrameReader:
@@ -226,6 +234,9 @@ class AsyncWorkloop:
         self.synqW_fd = worker.synqW_fd
         self.jobs = {}
         self.accepting = True
+        self.exitcode = EX_OK
+        self.memory_limit = getattr(worker, 'memory_limit', None)
+        self.memory_reported = False
         self.loop = None
         self.loop_thread = None
         self.executor = None
@@ -277,7 +288,7 @@ class AsyncWorkloop:
             self.executor.shutdown(wait=clean, cancel_futures=not clean)
             self.writer.stop(None if clean else self.writer_stop_timeout)
             loop.close()
-        return EX_OK
+        return self.exitcode
 
     def _add_reader(self, fd, callback):
         os.set_blocking(fd, False)
@@ -336,6 +347,9 @@ class AsyncWorkloop:
         for message in messages:
             if message and message[0] == CANCEL:
                 self.on_cancel(*message[1:])
+            elif message and message[0] == STOP:
+                self.exitcode = EX_RECYCLE
+                self.stop_accepting()
             else:
                 logger.error('Unknown control message from the parent: %r',
                              message)
@@ -362,8 +376,8 @@ class AsyncWorkloop:
         _current_job.set(entry)
         try:
             result = (True, self.worker.prepare_result(fun(*args, **kwargs)))
-        except _JobTerminated as exc:
-            result = _terminated_result(exc.signum)
+        except _JobAborted as exc:
+            result = _error_result(exc.exc)
         except BaseException:  # pylint: disable=broad-except
             result = (False, ExceptionInfo())
         self.send((READY, (entry.id, entry.index, result, self.inqW_fd)))
@@ -374,8 +388,17 @@ class AsyncWorkloop:
 
     def on_job_done(self, entry):
         self.jobs.pop(entry.id, None)
+        if self.memory_limit and not self.memory_reported:
+            self.check_memory()
         if not self.accepting and not self.jobs:
             self.loop.stop()
+
+    def check_memory(self):
+        """Ask the parent for recycling when memory use exceeds the limit."""
+        used_kb = mem_rss()
+        if used_kb > self.memory_limit:
+            self.memory_reported = True
+            self.send((RECYCLE_REQUEST, (self.pid, 'max memory', used_kb)))
 
     def on_cancel(self, job_id, reason, signum=None):
         entry = self.jobs.get(job_id)
@@ -445,16 +468,16 @@ def _cancel_exception(entry):
     if reason == CANCEL_SOFT:
         return SoftTimeLimitExceeded()
     if reason == CANCEL_HARD:
-        return TimeLimitExceeded()
+        return _JobAborted(TimeLimitExceeded())
     if reason == CANCEL_TERMINATE:
-        return _JobTerminated(entry.signum)
+        return _JobAborted(Terminated(entry.signum or 0))
     return concurrent.futures.CancelledError('The task coroutine was cancelled.')
 
 
-def _terminated_result(signum):
+def _error_result(exc):
     try:
-        raise Terminated(signum or 0)
-    except Terminated:
+        raise exc
+    except BaseException:  # pylint: disable=broad-except
         return False, ExceptionInfo()
 
 
@@ -469,15 +492,18 @@ class AsyncWorker(Worker):
 
     Workloop = AsyncWorkloop
 
-    def __init__(self, *args, capacity=1, block_warning=1.0, **kwargs):
+    def __init__(self, *args, capacity=1, block_warning=1.0,
+                 memory_limit=None, **kwargs):
         self.capacity = capacity
         self.block_warning = block_warning
+        self.memory_limit = memory_limit
         super().__init__(*args, **kwargs)
 
     def __reduce__(self):
         cls, args = super().__reduce__()
         return partial(cls, capacity=self.capacity,
-                       block_warning=self.block_warning), args
+                       block_warning=self.block_warning,
+                       memory_limit=self.memory_limit), args
 
     def after_fork(self):
         super().after_fork()

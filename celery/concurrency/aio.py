@@ -120,6 +120,8 @@ class TaskPool(prefork.TaskPool):
             processes=self.async_processes,
             capacity=self.async_capacity,
             block_warning=conf.worker_async_block_warning if conf else 1.0,
+            recycle_timeout=(conf.worker_async_recycle_timeout
+                             if conf else 30.0),
             initializer=process_initializer,
             on_process_exit=process_destructor,
             enable_timeouts=True,
@@ -211,6 +213,12 @@ class TaskPool(prefork.TaskPool):
             'async-processes': (self._async.process_info()
                                 if self._async is not None else []),
         })
+        semaphore = self.task_semaphore
+        if semaphore is not None:
+            info['free-slots'] = {
+                'sync': semaphore.sync_semaphore.value,
+                'async': semaphore.async_semaphore.value,
+            }
         return info
 
     @property
