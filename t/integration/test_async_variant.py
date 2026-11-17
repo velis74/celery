@@ -93,3 +93,18 @@ def test_apply_and_direct_call_run_sync_function():
 def test_functools_wraps_wrapper_routes_to_async_implementation(make_worker):
     w = make_worker('-c', '1', '--aconcurrency=10', '--aprocesses=1')
     assert values(w, tasks.wrapped) == [['async', 'async']]
+
+
+def test_async_body_in_a_sync_wrapper(make_worker):
+    w = make_worker('-c', '1', '--aconcurrency=50', '--aprocesses=1')
+    rs = [w.send(tasks.async_body, 0.5) for _ in range(20)]
+    start = time.monotonic()
+    assert results(rs) == [('SUCCESS', [r.id, 'async']) for r in rs]
+    assert time.monotonic() - start < 5
+
+
+def test_async_body_in_a_sync_wrapper_without_async_processes(make_worker):
+    w = make_worker('-c', '1')
+    r = w.send(tasks.async_body, 0)
+    assert results([r]) == [('SUCCESS', [r.id, 'prefork'])]
+    assert tasks.async_body.apply((0,), task_id='eager').get() == ['eager', None]
