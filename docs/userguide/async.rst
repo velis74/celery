@@ -11,6 +11,41 @@
     :local:
     :depth: 2
 
+.. _async-installation:
+
+Installation
+============
+
+Async tasks are available in the ``async-worker`` branch of the
+``velis74/celery`` fork, version ``5.7.0+velis1``, which is based on Celery
+5.7.0. It is installed from git:
+
+uv, in ``pyproject.toml``:
+
+.. code-block:: toml
+
+    [project]
+    dependencies = ["celery[redis]"]
+
+    [tool.uv.sources]
+    celery = { git = "https://github.com/velis74/celery", branch = "async-worker" }
+
+pip, with a PEP 508 direct reference (also usable in a requirements file):
+
+.. code-block:: console
+
+    $ pip install "celery[redis] @ git+https://github.com/velis74/celery@async-worker"
+
+Poetry, in ``pyproject.toml``:
+
+.. code-block:: toml
+
+    [tool.poetry.dependencies]
+    celery = { git = "https://github.com/velis74/celery", branch = "async-worker", extras = ["redis"] }
+
+Use ``rev = "<commit>"`` (uv, Poetry) or ``@<commit>`` (pip) in place of the
+branch to pin a commit.
+
 .. _async-overview:
 
 Overview
