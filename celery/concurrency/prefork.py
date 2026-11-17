@@ -17,6 +17,7 @@ from celery import platforms, signals
 from celery._state import _set_task_join_will_block, set_default_app
 from celery.app import base as _app_base
 from celery.app import trace
+from celery.concurrency import PREFORK, _set_process_kind
 from celery.concurrency.base import BasePool
 from celery.utils.functional import noop
 from celery.utils.log import get_logger
@@ -44,12 +45,17 @@ warning, debug = logger.warning, logger.debug
 _process_hostname = None
 
 
-def process_initializer(app, hostname):
+def process_initializer(app, hostname, process_kind=PREFORK,
+                        process_capacity=1):
     """Pool child process initializer.
 
     Initialize the child pool process to ensure the correct
     app instance is used and things like logging works.
+    ``process_kind`` and ``process_capacity`` are the values returned by
+    :func:`celery.concurrency.current_process_kind` and
+    :func:`celery.concurrency.current_process_capacity` in the process.
     """
+    _set_process_kind(process_kind, process_capacity)
     # Each running worker gets SIGKILL by OS when main process exits.
     platforms.set_pdeathsig('SIGKILL')
     _set_task_join_will_block(True)

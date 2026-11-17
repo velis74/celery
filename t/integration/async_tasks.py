@@ -9,7 +9,9 @@ import signal
 import time
 
 from celery import Celery
+from celery.concurrency import current_process_capacity, current_process_kind
 from celery.exceptions import SoftTimeLimitExceeded
+from celery.signals import worker_process_init
 
 BROKER = os.environ.get('ASYNC_TEST_BROKER', 'redis://127.0.0.1:6390/0')
 BACKEND = os.environ.get('ASYNC_TEST_BACKEND', 'redis://127.0.0.1:6390/1')
@@ -109,3 +111,38 @@ async def acrash_once(self, flag_path):
         return ['survived', os.getpid()]
     os.close(fd)
     os.kill(os.getpid(), signal.SIGKILL)
+
+
+# Process kind and capacity seen by ``worker_process_init``, by process id.
+PROCESS_INIT_VALUES = {}
+
+
+@worker_process_init.connect
+def record_process_kind(**kwargs):
+    PROCESS_INIT_VALUES[os.getpid()] = [
+        current_process_kind(), current_process_capacity()]
+
+
+@app.task
+def process_kind():
+    return [current_process_kind(), current_process_capacity()]
+
+
+@app.task
+async def aprocess_kind():
+    await asyncio.sleep(0)
+    return [current_process_kind(), current_process_capacity()]
+
+
+@app.task
+def process_init_values():
+    """Values recorded at process init and current values, in this process."""
+    return [PROCESS_INIT_VALUES.get(os.getpid()),
+            [current_process_kind(), current_process_capacity()]]
+
+
+@app.task
+async def aprocess_init_values():
+    await asyncio.sleep(0)
+    return [PROCESS_INIT_VALUES.get(os.getpid()),
+            [current_process_kind(), current_process_capacity()]]
