@@ -6,10 +6,12 @@ Tasks whose body is a coroutine function run in the async part
 prefork part, as with :class:`celery.concurrency.prefork.TaskPool`.
 """
 import math
+from functools import partial
 
 from kombu.asynchronous.semaphore import LaxBoundedSemaphore
 
 from celery.app.trace import is_async_task
+from celery.concurrency import ASYNC
 from celery.utils.functional import noop
 
 from . import prefork
@@ -122,7 +124,8 @@ class TaskPool(prefork.TaskPool):
             block_warning=conf.worker_async_block_warning if conf else 1.0,
             recycle_timeout=(conf.worker_async_recycle_timeout
                              if conf else 30.0),
-            initializer=process_initializer,
+            initializer=partial(process_initializer, process_kind=ASYNC,
+                                process_capacity=self.async_capacity),
             on_process_exit=process_destructor,
             enable_timeouts=True,
             synack=False,
