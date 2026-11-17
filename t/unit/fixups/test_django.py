@@ -1,5 +1,7 @@
 import asyncio
 import functools
+import sys
+import types
 from contextlib import contextmanager
 from unittest.mock import MagicMock, Mock, patch
 
@@ -26,6 +28,7 @@ class FixupCase:
                 with patch('celery.fixups.django.import_module') as impmod:
                     worker = Mock()
                     worker.pool_cls = Mock(__module__='celery.concurrency.prefork')
+                    worker.async_concurrency = 0
                     f = self.Fixup(app, **kwargs)
                     f.worker = worker
                     yield f, impmod, symbyname
@@ -435,8 +438,105 @@ class test_is_coroutine_task:
         assert add(1, 2) == 3
 
 
+def fake_asgiref_sync(with_executors=True):
+    """Module with the parts of ``asgiref.sync`` used by the fixup."""
+    module = types.ModuleType('asgiref.sync')
+    current, executors = [], {}
+
+    class SyncToAsync:
+        pass
+
+    if with_executors:
+        SyncToAsync.context_to_thread_executor = executors
+
+    class ThreadSensitiveContext:
+        async def __aenter__(self):
+            current.append(self)
+            return self
+
+        async def __aexit__(self, *exc_info):
+            executors.pop(current.pop(), None)
+
+    def sync_to_async(fun, thread_sensitive=True):
+        async def call(*args, **kwargs):
+            # Starts the thread of the current context.
+            executors[current[-1]] = Mock()
+            return fun(*args, **kwargs)
+        return call
+
+    module.SyncToAsync = SyncToAsync
+    module.ThreadSensitiveContext = ThreadSensitiveContext
+    module.sync_to_async = sync_to_async
+    return module
+
+
 class test_DjangoWorkerFixup(FixupCase):
     Fixup = DjangoWorkerFixup
+
+    @pytest.mark.parametrize('async_concurrency', [0, 5])
+    def test_install_async_task_wrapper(self, async_concurrency):
+        asgiref_sync = fake_asgiref_sync()
+        with self.fixup_context(self.app) as (f, _, _), \
+                patch('celery.fixups.django.signals'), \
+                patch.dict(sys.modules, {'asgiref.sync': asgiref_sync}), \
+                patch('celery.concurrency.aioworker.add_task_wrapper') as add:
+            f.worker.async_concurrency = async_concurrency
+            f.install()
+            if async_concurrency:
+                add.assert_called_once_with(f.run_async_task)
+            else:
+                add.assert_not_called()
+
+    def test_install_async_task_wrapper_without_asgiref(self):
+        with self.fixup_context(self.app) as (f, _, _), \
+                patch.dict(sys.modules, {'asgiref.sync': None}), \
+                patch('celery.fixups.django.logger') as logger, \
+                patch('celery.concurrency.aioworker.add_task_wrapper') as add:
+            f.install_async_task_wrapper()
+            add.assert_not_called()
+            logger.warning.assert_called_once()
+
+    @pytest.mark.parametrize('uses_thread,with_executors,closes', [
+        (True, True, True),
+        (False, True, False),
+        (False, False, True),
+    ])
+    def test_run_async_task(self, uses_thread, with_executors, closes):
+        asgiref_sync = fake_asgiref_sync(with_executors)
+
+        async def task():
+            if uses_thread:
+                await asgiref_sync.sync_to_async(lambda: None)()
+            return 42
+
+        with self.fixup_context(self.app) as (f, _, _), \
+                patch.dict(sys.modules, {'asgiref.sync': asgiref_sync}), \
+                patch.object(f, 'close_task_connections') as close:
+            assert asyncio.run(f.run_async_task(task())) == 42
+        assert close.called is closes
+
+    def test_run_async_task_closes_after_error(self):
+        asgiref_sync = fake_asgiref_sync()
+
+        async def task():
+            await asgiref_sync.sync_to_async(lambda: None)()
+            raise KeyError('task')
+
+        with self.fixup_context(self.app) as (f, _, _), \
+                patch.dict(sys.modules, {'asgiref.sync': asgiref_sync}), \
+                patch.object(f, 'close_task_connections') as close:
+            with pytest.raises(KeyError):
+                asyncio.run(f.run_async_task(task()))
+        close.assert_called_once_with()
+
+    def test_close_task_connections(self):
+        with self.fixup_context(self.app) as (f, _, _):
+            f.db_reuse_max = 10
+            with patch.object(f, '_close_database') as _close, \
+                    patch.object(f, 'close_cache') as close_cache:
+                f.close_task_connections()
+            _close.assert_called_once_with()
+            close_cache.assert_called_once_with()
 
     def test_init(self):
         with self.fixup_context(self.app) as (f, importmod, sym):

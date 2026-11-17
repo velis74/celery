@@ -213,9 +213,53 @@ class DjangoWorkerFixup:
         signals.task_prerun.connect(self.on_task_prerun)
         signals.task_postrun.connect(self.on_task_postrun)
         signals.worker_process_init.connect(self.on_worker_process_init)
+        if getattr(self.worker, 'async_concurrency', 0):
+            self.install_async_task_wrapper()
         self.close_database()
         self.close_cache()
         return self
+
+    def install_async_task_wrapper(self) -> None:
+        """Run the coroutines of async pool tasks with :meth:`run_async_task`.
+
+        Requires ``asgiref.sync.ThreadSensitiveContext`` (asgiref 3.3).
+        """
+        try:
+            from asgiref.sync import ThreadSensitiveContext  # noqa: F401
+        except ImportError:
+            logger.warning('Django fixup: asgiref.sync.ThreadSensitiveContext '
+                           'is not available, so database connections of '
+                           'async tasks are not closed.')
+            return
+        from celery.concurrency.aioworker import add_task_wrapper
+        add_task_wrapper(self.run_async_task)
+
+    async def run_async_task(self, coroutine: Any) -> Any:
+        """Await the coroutine of a task in a thread-sensitive context of its own.
+
+        Code that the task runs with ``sync_to_async(thread_sensitive=True)``,
+        such as the async methods of the Django ORM, runs in a thread of the
+        task.  When the task ends, the database connections and caches of
+        that thread are closed and the thread exits.
+        """
+        from asgiref.sync import SyncToAsync, ThreadSensitiveContext, sync_to_async
+        async with ThreadSensitiveContext() as context:
+            try:
+                return await coroutine
+            finally:
+                executors = getattr(SyncToAsync, 'context_to_thread_executor', None)
+                # Without a thread of its own, the task has no connections.
+                if executors is None or context in executors:
+                    await sync_to_async(self.close_task_connections,
+                                        thread_sensitive=True)()
+
+    def close_task_connections(self) -> None:
+        """Close the database connections and caches of the current thread.
+
+        Ignores ``CELERY_DB_REUSE_MAX``.
+        """
+        self._close_database()
+        self.close_cache()
 
     def on_worker_process_init(self, **kwargs: Any) -> None:
         # Child process must validate models again if on Windows,

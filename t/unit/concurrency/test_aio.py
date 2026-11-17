@@ -455,6 +455,30 @@ class test_AsyncWorkloop:
         finally:
             set_task_awaiter(None)
 
+    def test_task_wrappers(self, worker):
+        calls = []
+
+        def make_wrapper(name):
+            async def wrapper(coroutine):
+                calls.append((name, 'enter'))
+                try:
+                    return name, await coroutine
+                finally:
+                    calls.append((name, 'exit'))
+            return wrapper
+
+        with patch.object(aioworker, '_task_wrappers', []):
+            aioworker.add_task_wrapper(make_wrapper('inner'))
+            aioworker.add_task_wrapper(make_wrapper('outer'))
+            workloop, thread, _ = start_loop(worker)
+            worker.send_task(1, run_awaited, sleep_and_return, 0, 'x')
+            worker.send_sentinel()
+            thread.join(5)
+        assert readies(worker.outq.messages) == {
+            1: (True, ('outer', ('inner', 'x')))}
+        assert calls == [('outer', 'enter'), ('inner', 'enter'),
+                         ('inner', 'exit'), ('outer', 'exit')]
+
 
 class test_LoopWatchdog:
 
