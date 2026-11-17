@@ -139,12 +139,43 @@ def ack_promise(name, side_effect=None):
 @patch('celery.platforms.set_mp_process_title')
 class test_process_initializer:
 
+    @pytest.fixture(autouse=True)
+    def restore_process_kind(self):
+        import celery.concurrency as concurrency
+        saved = concurrency._process_kind, concurrency._process_capacity
+        yield
+        concurrency._set_process_kind(*saved)
+
     @staticmethod
     def Loader(*args, **kwargs):
         loader = Mock(*args, **kwargs)
         loader.conf = {}
         loader.override_backends = {}
         return loader
+
+    @patch('celery.platforms.signals')
+    @patch('celery.concurrency.prefork.get_start_method', return_value='fork')
+    def test_process_kind(self, _get_start_method, _signals, set_mp_process_title, restore_logging):
+        from celery import signals
+        from celery.concurrency import current_process_capacity, current_process_kind
+        from celery.concurrency.prefork import process_initializer
+        seen = []
+
+        def on_worker_process_init(**kwargs):
+            seen.append((current_process_kind(), current_process_capacity()))
+
+        assert current_process_kind() is None
+        assert current_process_capacity() is None
+        signals.worker_process_init.connect(on_worker_process_init)
+        try:
+            with self.Celery(loader=self.Loader) as app:
+                app.conf = AttributeDict(DEFAULTS)
+                process_initializer(app, 'prefork.worker.com')
+                process_initializer(app, 'async.worker.com',
+                                    process_kind='async', process_capacity=5)
+        finally:
+            signals.worker_process_init.disconnect(on_worker_process_init)
+        assert seen == [('prefork', 1), ('async', 5)]
 
     @patch('celery.platforms.signals')
     @patch('celery.concurrency.prefork.get_start_method', return_value='fork')
@@ -1736,3 +1767,25 @@ class test_TaskPool:
         # spawned children must be flagged as fresh interpreters so they
         # re-run setup_worker_optimizations in process_initializer.
         assert os.environ.get('FORKED_BY_MULTIPROCESSING') == '1'
+
+
+@t.skip.if_win32
+def test_process_kind_is_not_inherited_by_forked_children():
+    import celery.concurrency as concurrency
+    saved = concurrency._process_kind, concurrency._process_capacity
+    concurrency._set_process_kind('async', 4)
+    try:
+        r, w = os.pipe()
+        pid = os.fork()
+        if not pid:
+            os.write(w, repr((concurrency.current_process_kind(),
+                              concurrency.current_process_capacity())).encode())
+            os._exit(0)
+        os.close(w)
+        with os.fdopen(r) as reader:
+            child = reader.read()
+        os.waitpid(pid, 0)
+    finally:
+        concurrency._set_process_kind(*saved)
+    assert child == '(None, None)'
+    assert concurrency.current_process_kind() == saved[0]

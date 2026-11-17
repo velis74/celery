@@ -213,6 +213,37 @@ result. So:
 - :signal:`worker_process_init` and :signal:`worker_process_shutdown` are
   sent in async processes too.
 
+.. _async-process-kind:
+
+Process kind
+------------
+
+:func:`celery.concurrency.current_process_kind` returns ``'async'`` in an
+async process, ``'prefork'`` in a prefork process and :const:`None` in any
+other process (the main worker process, the solo, threads, eventlet and
+gevent pools, clients, processes forked from a pool process). :func:`celery.concurrency.current_process_capacity`
+returns the number of tasks the process runs at the same time:
+``ceil(aconcurrency / aprocesses)`` in an async process, ``1`` in a prefork
+process, :const:`None` elsewhere.
+
+Both values are set before :signal:`worker_process_init` is sent and are the
+same in every thread of the process. Task modules are imported in the main
+worker process, where both are :const:`None`, so code at module level cannot
+use them; :signal:`worker_process_init` handlers and tasks can:
+
+.. code-block:: python
+
+    from celery.concurrency import current_process_capacity, current_process_kind
+    from celery.signals import worker_process_init
+
+
+    @worker_process_init.connect
+    def init_database(**kwargs):
+        if current_process_kind() == 'async':
+            db.connect_async(pool_size=current_process_capacity())
+        else:
+            db.connect()
+
 .. _async-blocking:
 
 Blocking the event loop
