@@ -1,7 +1,12 @@
 import asyncio
 import contextvars
+import copy
+import os
+import pickle
 import socket
+import subprocess
 import sys
+import textwrap
 import threading
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,8 +15,7 @@ import pytest
 
 from celery import _state
 from celery.app.task import Task
-from celery.utils.threads import (Local, LocalManager, LocalStack, _context_stacks, _ContextLocalStack,
-                                  _FastLocalStack, _LocalStack, bgThread, bound_open_broker_sockets,
+from celery.utils.threads import (Local, LocalManager, LocalStack, bgThread, bound_open_broker_sockets,
                                   default_socket_timeout, release_local)
 from t.unit import conftest
 
@@ -197,26 +201,7 @@ class test_Local:
 class test_LocalStack:
 
     def test_stack(self):
-        x = _LocalStack()
-        assert x.pop() is None
-        x.__release_local__()
-        ident = x.__ident_func__
-        x.__ident_func__ = ident
-
-        with pytest.raises(RuntimeError):
-            x()[0]
-
-        x.push(['foo'])
-        assert x()[0] == 'foo'
-        x.pop()
-        with pytest.raises(RuntimeError):
-            x()[0]
-
-
-class test_ContextLocalStack:
-
-    def test_stack(self):
-        x = _ContextLocalStack()
+        x = LocalStack()
         assert x.pop() is None
         assert x.top is None
         assert x.stack == []
@@ -238,14 +223,14 @@ class test_ContextLocalStack:
             x()[0]
 
     def test_stack_is_a_copy(self):
-        x = _ContextLocalStack()
+        x = LocalStack()
         x.push(1)
         x.stack.append(2)
         x.push(3).append(4)
         assert x.stack == [1, 3]
 
     def test_release_local(self):
-        x = _ContextLocalStack()
+        x = LocalStack()
         x.push(1)
         x.push(2)
         release_local(x)
@@ -253,27 +238,52 @@ class test_ContextLocalStack:
         assert len(x) == 0
 
     def test_instances_are_independent(self):
-        x, y = _ContextLocalStack(), _ContextLocalStack()
+        x, y = LocalStack(), LocalStack()
         x.push(1)
         assert y.top is None
         x.pop()
 
-    def test_attribute_can_be_patched(self):
-        x = _ContextLocalStack()
-        with patch.object(x, 'push', wraps=x.push) as push:
-            x.push(1)
-        push.assert_called_once_with(1)
+    def test_copies_are_new_empty_stacks(self):
+        x = LocalStack('named')
+        x.push(1)
+        holder = {'stack': x}
+        for copied in (copy.copy(x), copy.deepcopy(holder)['stack'], pickle.loads(pickle.dumps(x))):
+            assert copied is not x
+            assert copied.name == 'named'
+            assert copied.top is None
+            copied.push(2)
+            assert x.stack == [1]
+            copied.pop()
         assert x.pop() == 1
 
-    def test_class_getitem(self):
-        assert isinstance(_ContextLocalStack[int](), _ContextLocalStack)
+    def test_use_fast_locals_is_deprecated_at_worker_start(self, tmp_path):
+        script = textwrap.dedent('''
+            import os
+            import sys
+            from celery import Celery, signals
 
-    def test_default_local_stack(self):
-        assert LocalStack is _ContextLocalStack
-        assert isinstance(_state._task_stack, _ContextLocalStack)
+            app = Celery('fast', broker='memory://', set_as_current=False)
+
+            @signals.worker_ready.connect
+            def stop(**kwargs):
+                sys.stderr.flush()
+                os._exit(0)
+
+            app.Worker(pool='solo', concurrency=1, quiet=True, without_heartbeat=True,
+                       without_mingle=True, without_gossip=True).start()
+        ''')
+        env = {**os.environ, 'USE_FAST_LOCALS': 'yes'}
+        env.pop('PYTHONWARNINGS', None)
+        proc = subprocess.run(
+            [sys.executable, '-c', script], cwd=tmp_path,
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert 'CDeprecationWarning' in proc.stderr
+        assert 'USE_FAST_LOCALS' in proc.stderr
 
     def test_threads_are_isolated(self):
-        x = _ContextLocalStack()
+        x = LocalStack()
         x.push('main')
         barrier = threading.Barrier(3)
         seen = {}
@@ -297,7 +307,7 @@ class test_ContextLocalStack:
         assert x.pop() == 'main'
 
     def test_thread_with_copied_context_keeps_snapshot(self):
-        x = _ContextLocalStack()
+        x = LocalStack()
         x.push('request-A')
         ctx = contextvars.copy_context()
         x.pop()
@@ -321,25 +331,21 @@ class test_ContextLocalStack:
         assert seen == ['request-A', ['request-A']]
         assert x.top is None
 
-    def test_context_does_not_grow(self):
-        base = len(contextvars.copy_context())
-        for _ in range(100):
-            x = _ContextLocalStack()
-            x.push(1)
-            x.pop()
-            y = _ContextLocalStack()
-            y.push(2)
-            release_local(y)
-        assert len(contextvars.copy_context()) <= base + 1
-
-    def test_empty_stack_is_not_referenced(self):
-        x = _ContextLocalStack()
-        x.push(1)
+    def test_repeated_use_does_not_grow_the_context(self):
+        x = LocalStack()
+        x.push(0)
         x.pop()
-        assert x not in _context_stacks.get()
+        size = len(contextvars.copy_context())
+        for n in range(100):
+            x.push(n)
+            x.push(n)
+            x.pop()
+            release_local(x)
+        assert len(contextvars.copy_context()) == size
+        assert x.top is None
 
     def test_asyncio_tasks_are_isolated(self):
-        x = _ContextLocalStack()
+        x = LocalStack()
         x.push('outer')
 
         async def worker(n):
@@ -357,7 +363,7 @@ class test_ContextLocalStack:
         assert x.pop() == 'outer'
 
     def test_run_coroutine_threadsafe_sees_caller_stack(self):
-        x = _ContextLocalStack()
+        x = LocalStack()
         loop = asyncio.new_event_loop()
         loop_thread = threading.Thread(target=loop.run_forever)
         loop_thread.start()
@@ -391,7 +397,7 @@ class test_ContextLocalStack:
 
     def test_gevent_greenlets_are_isolated(self):
         gevent = pytest.importorskip('gevent')
-        x = _ContextLocalStack()
+        x = LocalStack()
 
         def target(n):
             x.push(n)
@@ -412,7 +418,7 @@ class test_task_stacks_are_context_local:
         def add(x, y):
             return x + y
 
-        assert isinstance(add.request_stack, _ContextLocalStack)
+        assert isinstance(add.request_stack, LocalStack)
 
         async def worker(n):
             add.push_request(id=f'id-{n}')
@@ -442,20 +448,6 @@ class test_task_stacks_are_context_local:
 
         assert a.request_stack is not b.request_stack
         assert Task.request_stack is None
-
-
-class test_FastLocalStack:
-
-    def test_stack(self):
-        x = _FastLocalStack()
-        x.push(['foo'])
-        x.push(['bar'])
-        assert x.top == ['bar']
-        assert len(x) == 2
-        x.pop()
-        assert x.top == ['foo']
-        x.pop()
-        assert x.top is None
 
 
 class test_LocalManager:

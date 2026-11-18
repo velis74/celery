@@ -27,7 +27,7 @@ from celery.utils.debug import cry
 from celery.utils.imports import qualname
 from celery.utils.log import get_logger, in_sighandler, set_in_sighandler
 from celery.utils.text import pluralize
-from celery.utils.threads import bound_open_broker_sockets
+from celery.utils.threads import bound_open_broker_sockets, warn_use_fast_locals
 from celery.utils.time import humanize_seconds
 from celery.worker import WorkController
 from celery.worker.worker import SHUTDOWN_SOCKET_TIMEOUT
@@ -153,6 +153,8 @@ class Worker(WorkController):
         self.install_platform_tweaks(self)
         if not self._custom_logging and self.redirect_stdouts:
             app.log.redirect_stdouts(self.redirect_stdouts_level)
+
+        warn_use_fast_locals()
 
         # TODO: Remove the following code in Celery 6.0
         # This qualifies as a hack for issue #6366.

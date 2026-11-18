@@ -5,6 +5,7 @@ import sys
 import threading
 import traceback
 import types
+import warnings
 from contextlib import contextmanager
 from contextvars import ContextVar
 from threading import TIMEOUT_MAX as THREAD_TIMEOUT_MAX
@@ -31,7 +32,18 @@ __all__ = (
     'get_ident', 'default_socket_timeout', 'bound_open_broker_sockets',
 )
 
-USE_FAST_LOCALS = os.environ.get('USE_FAST_LOCALS')
+
+def warn_use_fast_locals():
+    """Warn when the ``USE_FAST_LOCALS`` environment variable is set.
+
+    The variable has no effect: :class:`LocalStack` is always bound to the
+    current :mod:`contextvars` context.
+    """
+    if os.environ.get('USE_FAST_LOCALS'):
+        from celery.exceptions import CDeprecationWarning
+        warnings.warn(CDeprecationWarning(
+            'The USE_FAST_LOCALS environment variable has no effect: '
+            'LocalStack is always bound to the current contextvars context.'))
 
 
 @contextmanager
@@ -153,7 +165,7 @@ def release_local(local):
     This makes it possible to use locals without a manager.
 
     With this function one can release :class:`Local` objects as well as
-    :class:`StackLocal` objects.  However it's not possible to
+    :class:`LocalStack` objects.  However it's not possible to
     release data held by proxies that way, one always has to retain
     a reference to the underlying local object in order to be able
     to release it.
@@ -208,121 +220,14 @@ class Local:
             raise AttributeError(name)
 
 
-class _LocalStack:
-    """Local stack.
-
-    This class works similar to a :class:`Local` but keeps a stack
-    of objects instead.  This is best explained with an example::
-
-        >>> ls = LocalStack()
-        >>> ls.push(42)
-        >>> ls.top
-        42
-        >>> ls.push(23)
-        >>> ls.top
-        23
-        >>> ls.pop()
-        23
-        >>> ls.top
-        42
-
-    They can be force released by using a :class:`LocalManager` or with
-    the :func:`release_local` function but the correct way is to pop the
-    item from the stack after using.  When the stack is empty it will
-    no longer be bound to the current context (and as such released).
-
-    By calling the stack without arguments it will return a proxy that
-    resolves to the topmost item on the stack.
-    """
-
-    def __init__(self):
-        self._local = Local()
-
-    def __release_local__(self):
-        self._local.__release_local__()
-
-    def _get__ident_func__(self):
-        return self._local.__ident_func__
-
-    def _set__ident_func__(self, value):
-        object.__setattr__(self._local, '__ident_func__', value)
-    __ident_func__ = property(_get__ident_func__, _set__ident_func__)
-    del _get__ident_func__, _set__ident_func__
-
-    def __call__(self):
-        def _lookup():
-            rv = self.top
-            if rv is None:
-                raise RuntimeError('object unbound')
-            return rv
-        return Proxy(_lookup)
-
-    def push(self, obj):
-        """Push a new item to the stack."""
-        rv = getattr(self._local, 'stack', None)
-        if rv is None:
-            # pylint: disable=assigning-non-slot
-            # This attribute is defined now.
-            self._local.stack = rv = []
-        rv.append(obj)
-        return rv
-
-    def pop(self):
-        """Remove the topmost item from the stack.
-
-        Note:
-            Will return the old value or `None` if the stack was already empty.
-        """
-        stack = getattr(self._local, 'stack', None)
-        if stack is None:
-            return None
-        elif len(stack) == 1:
-            release_local(self._local)
-            return stack[-1]
-        else:
-            return stack.pop()
-
-    __class_getitem__ = classmethod(types.GenericAlias)
-
-    def __len__(self):
-        stack = getattr(self._local, 'stack', None)
-        return len(stack) if stack else 0
-
-    @property
-    def stack(self):
-        # get_current_worker_task uses this to find
-        # the original task that was executed by the worker.
-        stack = getattr(self._local, 'stack', None)
-        if stack is not None:
-            return stack
-        return []
-
-    @property
-    def top(self):
-        """The topmost item on the stack.
-
-        Note:
-            If the stack is empty, :const:`None` is returned.
-        """
-        try:
-            return self._local.stack[-1]
-        except (AttributeError, IndexError):
-            return None
-
-
-#: Maps each non-empty :class:`_ContextLocalStack` to its items.  One
-#: variable serves all stacks, so creating stacks does not grow the context.
-_context_stacks = ContextVar('celery.utils.threads.context_stacks', default={})
-
-
-class _ContextLocalStack:
+class LocalStack:
     """Stack bound to the current :mod:`contextvars` context.
 
     Each thread, greenlet and :class:`asyncio.Task` has its own stack, and a
     coroutine scheduled with :func:`asyncio.run_coroutine_threadsafe` sees
-    the stack of the calling thread.  The items are an immutable tuple and
-    every push and pop sets a new mapping, so copied contexts never share
-    items.
+    the stack of the calling thread.  Every instance holds its items in its
+    own :class:`~contextvars.ContextVar` as an immutable tuple, and every
+    push and pop sets a new tuple, so copied contexts never share items.
 
     A thread started with a copy of the current context (the default with
     ``-X thread_inherit_context=1``, and on free-threaded builds, from
@@ -330,22 +235,42 @@ class _ContextLocalStack:
     start, and keeps it for the lifetime of the thread, including in the
     worker threads of a :class:`~concurrent.futures.ThreadPoolExecutor`.
 
-    Has the same interface as :class:`_LocalStack`.
+    A :class:`~contextvars.ContextVar` is never freed while a context that
+    holds a value for it exists, and a stack that was pushed once keeps an
+    entry (an empty tuple) in that context after it is emptied, about
+    100 bytes per stack and context.  Stacks are therefore created at module
+    or class level, not per call.  Celery creates one for the current task stack in
+    :mod:`celery._state` and one per bound task class for
+    :attr:`~celery.app.task.Task.request_stack`.
+
+    Example::
+
+        >>> ls = LocalStack()
+        >>> ls.push(42)
+        [42]
+        >>> ls.push(23)
+        [42, 23]
+        >>> ls.top
+        23
+        >>> ls.pop()
+        23
+        >>> ls.top
+        42
+
+    Calling the stack without arguments returns a proxy that resolves to
+    the topmost item.  :func:`release_local` and :class:`LocalManager`
+    empty the stack in the current context.
     """
 
     def __init__(self, name='celery.utils.threads.LocalStack'):
         self.name = name
+        self._var = ContextVar(name, default=())
+        self._get = self._var.get
+        self._set = self._var.set
 
-    def _get(self):
-        return _context_stacks.get().get(self, ())
-
-    def _set(self, stack):
-        stacks = dict(_context_stacks.get())
-        if stack:
-            stacks[self] = stack
-        else:
-            stacks.pop(self, None)
-        _context_stacks.set(stacks)
+    def __reduce__(self):
+        # A ContextVar cannot be pickled or copied: a copy is a new, empty stack.
+        return self.__class__, (self.name,)
 
     def __release_local__(self):
         self._set(())
@@ -411,7 +336,8 @@ class LocalManager:
     context.
 
     The ``ident_func`` parameter can be added to override the default ident
-    function for the wrapped locals.
+    function for the wrapped :class:`Local` objects.  :class:`LocalStack`
+    objects are bound to the :mod:`contextvars` context and ignore it.
     """
 
     def __init__(self, locals=None, ident_func=None):
@@ -431,7 +357,7 @@ class LocalManager:
     def get_ident(self):
         """Return context identifier.
 
-        This is the identifier the local objects use internally
+        This is the identifier the :class:`Local` objects use internally
         for this context.  You cannot override this method to change the
         behavior but use it to link other context local objects (such as
         SQLAlchemy's scoped sessions) to the Werkzeug locals.
@@ -449,32 +375,3 @@ class LocalManager:
     def __repr__(self):
         return '<{} storages: {}>'.format(
             self.__class__.__name__, len(self.locals))
-
-
-class _FastLocalStack(threading.local):
-
-    def __init__(self):
-        self.stack = []
-        self.push = self.stack.append
-        self.pop = self.stack.pop
-        super().__init__()
-
-    @property
-    def top(self):
-        try:
-            return self.stack[-1]
-        except (AttributeError, IndexError):
-            return None
-
-    __class_getitem__ = classmethod(types.GenericAlias)
-
-    def __len__(self):
-        return len(self.stack)
-
-
-if USE_FAST_LOCALS:  # pragma: no cover
-    LocalStack = _FastLocalStack
-else:  # pragma: no cover
-    # Context-local, so that threads, greenlets and asyncio tasks each
-    # have their own stack.
-    LocalStack = _ContextLocalStack

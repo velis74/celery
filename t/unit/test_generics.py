@@ -11,7 +11,7 @@ from celery.canvas import Signature
 from celery.local import class_property
 from celery.result import AsyncResult
 from celery.utils.objects import FallbackContext
-from celery.utils.threads import _FastLocalStack, _LocalStack
+from celery.utils.threads import LocalStack
 
 
 class test_Generics:
@@ -36,15 +36,10 @@ class test_Generics:
         assert isinstance(s, Signature), "Signature can be instantiated with type parameters"
         assert get_args(Signature[str]) == (str,), "__class_getitem__ returns a GenericAlias"
 
-    def test__LocalStack__class_getitem__(self):
-        stack = _LocalStack[Context]()
-        assert isinstance(stack, _LocalStack), "_LocalStack can be instantiated with type parameters"
-        assert get_args(_LocalStack[Context]) == (Context,), "__class_getitem__ returns a GenericAlias"
-
-    def test__FastLocalStack__class_getitem__(self):
-        s = _FastLocalStack[Context]()
-        assert isinstance(s, _FastLocalStack), "_FastLocalStack can be instantiated with type parameters"
-        assert get_args(_FastLocalStack[Context]) == (Context,), "__class_getitem__ returns a GenericAlias"
+    def test_LocalStack__class_getitem__(self):
+        stack = LocalStack[Context]()
+        assert isinstance(stack, LocalStack), "LocalStack can be instantiated with type parameters"
+        assert get_args(LocalStack[Context]) == (Context,), "__class_getitem__ returns a GenericAlias"
 
     def test_FallbackContext__class_getitem__(self):
         @contextlib.contextmanager

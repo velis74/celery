@@ -6,7 +6,6 @@ from celery import Celery
 
 os.environ.update(
     NOSETPS='yes',
-    USE_FAST_LOCALS='yes',
 )
 
 
