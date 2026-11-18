@@ -1,4 +1,5 @@
 """Actual App instance implementation."""
+import asyncio
 import functools
 import importlib
 import inspect
@@ -8,7 +9,7 @@ import threading
 import types
 import typing
 import warnings
-from collections import UserDict, defaultdict, deque
+from collections import UserDict, defaultdict, deque, namedtuple
 from collections.abc import Mapping
 from datetime import datetime
 from datetime import timezone as datetime_timezone
@@ -59,6 +60,12 @@ if typing.TYPE_CHECKING:  # pragma: no cover  # codecov does not capture this
 __all__ = ('Celery',)
 
 _OMITTED = object()
+
+#: A task message built by :meth:`Celery._prepare_send_task`, not yet published.
+_PreparedTask = namedtuple('_PreparedTask', (
+    'name', 'task_id', 'message', 'options', 'producer', 'connection',
+    'ignore_result', 'result_cls', 'add_to_parent', 'parent', 'have_parent',
+))
 
 logger = get_logger(__name__)
 
@@ -1061,17 +1068,92 @@ class Celery:
         Arguments:
             name (str): Name of task to call (e.g., `"tasks.add"`).
             result_cls (AsyncResult): Specify custom result class.
+
+        See Also:
+            :meth:`asend_task` for sending from an :mod:`asyncio` event loop.
         """
+        if self.conf.task_always_eager:  # pragma: no cover
+            warnings.warn(AlwaysEagerIgnored(
+                'task_always_eager has no effect on send_task',
+            ), stacklevel=2)
+        prepared = self._prepare_send_task(
+            name, args, kwargs, countdown, eta, task_id, producer,
+            connection, router, result_cls, expires, publisher, link,
+            link_error, add_to_parent, group_id, group_index, retries, chord,
+            reply_to, time_limit, soft_time_limit, root_id, parent_id,
+            route_name, shadow, chain, task_type, replaced_task_nesting,
+            options,
+        )
+        self._publish_prepared_task(prepared)
+        return self._prepared_task_result(prepared)
+
+    async def asend_task(self, name, args=None, kwargs=None, countdown=None,
+                         eta=None, task_id=None, producer=None, connection=None,
+                         router=None, result_cls=None, expires=_OMITTED,
+                         publisher=None, link=None, link_error=None,
+                         add_to_parent=True, group_id=None, group_index=None,
+                         retries=0, chord=None,
+                         reply_to=None, time_limit=_OMITTED, soft_time_limit=_OMITTED,
+                         root_id=None, parent_id=None, route_name=None,
+                         shadow=None, chain=None, task_type=None, replaced_task_nesting=0, **options):
+        """Send task by name from an :mod:`asyncio` event loop.
+
+        Takes the arguments of :meth:`send_task`, sends the same message and
+        returns the same result.
+
+        With a Redis broker, the message is pushed to Redis from the event
+        loop, and messages sent in the same iteration of the loop share one
+        pipeline. Otherwise :meth:`send_task` runs in a worker thread
+        (:func:`asyncio.to_thread`). See :ref:`async-asend-task`.
+        """
+        async_publisher = None
+        if not (producer or connection or publisher or self.conf.task_always_eager):
+            async_publisher = self._async_publisher
+        if async_publisher is None:
+            return await asyncio.to_thread(
+                self.send_task, name, args=args, kwargs=kwargs,
+                countdown=countdown, eta=eta, task_id=task_id,
+                producer=producer, connection=connection, router=router,
+                result_cls=result_cls, expires=expires, publisher=publisher,
+                link=link, link_error=link_error, add_to_parent=add_to_parent,
+                group_id=group_id, group_index=group_index, retries=retries,
+                chord=chord, reply_to=reply_to, time_limit=time_limit,
+                soft_time_limit=soft_time_limit, root_id=root_id,
+                parent_id=parent_id, route_name=route_name, shadow=shadow,
+                chain=chain, task_type=task_type,
+                replaced_task_nesting=replaced_task_nesting, **options
+            )
+        prepared = self._prepare_send_task(
+            name, args, kwargs, countdown, eta, task_id, producer,
+            connection, router, result_cls, expires, publisher, link,
+            link_error, add_to_parent, group_id, group_index, retries, chord,
+            reply_to, time_limit, soft_time_limit, root_id, parent_id,
+            route_name, shadow, chain, task_type, replaced_task_nesting,
+            options,
+        )
+        await async_publisher.publish(prepared)
+        return self._prepared_task_result(prepared)
+
+    @cached_property
+    def _async_publisher(self):
+        """The publisher :meth:`asend_task` uses, or :const:`None` when the broker is not Redis."""
+        from .async_publish import RedisPublisher
+        return RedisPublisher.for_app(self)
+
+    def _prepare_send_task(self, name, args, kwargs, countdown, eta, task_id,
+                           producer, connection, router, result_cls, expires,
+                           publisher, link, link_error, add_to_parent,
+                           group_id, group_index, retries, chord, reply_to,
+                           time_limit, soft_time_limit, root_id, parent_id,
+                           route_name, shadow, chain, task_type,
+                           replaced_task_nesting, options):
+        """Build the message and publish options of a :meth:`send_task` call."""
         parent = have_parent = None
         amqp = self.amqp
         task_id = task_id or uuid()
         producer = producer or publisher  # XXX compat
         router = router or amqp.router
         conf = self.conf
-        if conf.task_always_eager:  # pragma: no cover
-            warnings.warn(AlwaysEagerIgnored(
-                'task_always_eager has no effect on send_task',
-            ), stacklevel=2)
 
         # If the caller did not supply a task_type (i.e. a plain
         # send_task("name", ...) call), look it up in the local registry
@@ -1219,21 +1301,34 @@ class Celery:
         for stamp in stamped_headers:
             options.pop(stamp)
 
-        if connection:
-            producer = amqp.Producer(connection, auto_declare=False)
+        return _PreparedTask(
+            name, task_id, message, options, producer, connection,
+            ignore_result, result_cls, add_to_parent, parent, have_parent,
+        )
+
+    def _publish_prepared_task(self, prepared):
+        """Publish the message of a :meth:`_prepare_send_task` result."""
+        producer = prepared.producer
+        if prepared.connection:
+            producer = self.amqp.Producer(prepared.connection, auto_declare=False)
 
         with self.producer_or_acquire(producer) as P:
             with P.connection._reraise_as_library_errors():
-                if not ignore_result:
-                    self.backend.on_task_call(P, task_id)
-                amqp.send_task_message(P, name, message, **options)
-        result = (result_cls or self.AsyncResult)(task_id)
+                if not prepared.ignore_result:
+                    self.backend.on_task_call(P, prepared.task_id)
+                self.amqp.send_task_message(
+                    P, prepared.name, prepared.message, **prepared.options)
+
+    def _prepared_task_result(self, prepared):
+        """Return the result of a published :meth:`_prepare_send_task` call."""
+        result = (prepared.result_cls or self.AsyncResult)(prepared.task_id)
         # We avoid using the constructor since a custom result class
         # can be used, in which case the constructor may still use
         # the old signature.
-        result.ignored = ignore_result
+        result.ignored = prepared.ignore_result
 
-        if add_to_parent:
+        if prepared.add_to_parent:
+            parent, have_parent = prepared.parent, prepared.have_parent
             if not have_parent:
                 parent, have_parent = self.current_worker_task, True
             if parent:

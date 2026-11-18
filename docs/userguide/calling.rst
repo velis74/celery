@@ -79,6 +79,8 @@ Using :meth:`~@Task.apply_async` instead you have to write:
 
     If the task isn't registered in the current process
     you can use :meth:`~@send_task` to call the task by name instead.
+    In an :mod:`asyncio` event loop, await :meth:`~@asend_task`
+    (see :ref:`async-asend-task`).
 
 
 So `delay` is clearly convenient, but if you want to set additional execution

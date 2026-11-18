@@ -40,6 +40,62 @@ key={0.routing_key}
 task_message = namedtuple('task_message',
                           ('headers', 'properties', 'body', 'sent_event'))
 
+#: A task message with its resolved destination and publish options.
+task_publish = namedtuple('task_publish', (
+    'body', 'headers', 'properties', 'sent_event', 'queue', 'qname',
+    'exchange', 'routing_key', 'declare', 'retry', 'retry_policy',
+    'serializer', 'compression', 'delivery_mode', 'timeout',
+    'confirm_timeout',
+))
+
+
+def task_publish_kwargs(publish):
+    """Return the :meth:`kombu.Producer.publish` arguments of a :class:`task_publish`."""
+    return dict(
+        exchange=publish.exchange,
+        routing_key=publish.routing_key,
+        serializer=publish.serializer,
+        compression=publish.compression,
+        retry=publish.retry, retry_policy=publish.retry_policy,
+        delivery_mode=publish.delivery_mode, declare=publish.declare,
+        headers=publish.headers,
+        timeout=publish.timeout, confirm_timeout=publish.confirm_timeout,
+        **publish.properties
+    )
+
+
+def send_task_sent_signal(name, body, headers):
+    """Send the deprecated :signal:`task_sent` signal of a published task."""
+    if signals.task_sent.receivers:  # XXX deprecated (remove 6.0)
+        if isinstance(body, tuple):  # protocol version 2
+            signals.task_sent.send(
+                sender=name, task_id=headers['id'], task=name,
+                args=body[0], kwargs=body[1],
+                eta=headers['eta'], taskset=headers['group'],
+            )
+        else:  # protocol version 1
+            signals.task_sent.send(
+                sender=name, task_id=body['id'], task=name,
+                args=body['args'], kwargs=body['kwargs'],
+                eta=body['eta'], taskset=body['taskset'],
+            )
+
+
+def task_sent_event(publish):
+    """Return the ``task-sent`` event fields of a :class:`task_publish`, or :const:`None`."""
+    sent_event = publish.sent_event
+    if sent_event:
+        exname = publish.exchange
+        if isinstance(exname, Exchange):
+            exname = exname.name
+        sent_event.update({
+            'queue': publish.qname,
+            'exchange': exname,
+            'routing_key': publish.routing_key,
+        })
+    return sent_event
+
+
 # Set while AMQP._retry_publish sends a callback, so that each of its
 # messages is retried on its own, waiting as its retry policy says.
 _callback_publish_retry = ContextVar('_callback_publish_retry', default=False)
@@ -314,6 +370,17 @@ class AMQP:
     def send_task_message(self):
         return self._create_task_sender()
 
+    @cached_property
+    def prepare_task_publish(self):
+        """Resolve the destination and publish options of a task message.
+
+        Takes the arguments of :attr:`send_task_message` after ``name``,
+        except ``event_dispatcher``, and returns a :class:`task_publish`.
+        Updates the headers and properties of the message as
+        :attr:`send_task_message` does; does no I/O.
+        """
+        return self._create_task_publish_preparer()
+
     def Queues(self, queues, create_missing=None, create_missing_queue_type=None,
                create_missing_queue_exchange_type=None, autoexchange=None, max_priority=None):
         # Create new :class:`Queues` instance, using queue defaults
@@ -528,33 +595,25 @@ class AMQP:
             raise ValueError(f'{what} is out of range: {s!r}')
         return s
 
-    def _create_task_sender(self):
+    def _create_task_publish_preparer(self):
         amqp = self
         default_retry = self.app.conf.task_publish_retry
         default_policy = self.app.conf.task_publish_retry_policy
         default_delivery_mode = self.app.conf.task_default_delivery_mode
         queues = self.queues
-        send_before_publish = signals.before_task_publish.send
-        send_after_publish = signals.after_task_publish.send
-
-        send_task_sent = signals.task_sent.send   # XXX compat (remove 6.0)
-        sent_receivers = signals.task_sent.receivers   # XXX compat (remove 6.0)
-
-        default_evd = self._event_dispatcher
         default_exchange = self.default_exchange
-
         default_rkey = self.app.conf.task_default_routing_key
         default_serializer = self.app.conf.task_serializer
         default_compressor = self.app.conf.task_compression
 
-        def send_task_message(producer, name, message,
-                              exchange=None, routing_key=None, queue=None,
-                              event_dispatcher=None,
-                              retry=None, retry_policy=None,
-                              serializer=None, delivery_mode=None,
-                              compression=None, declare=None,
-                              headers=None, exchange_type=None,
-                              timeout=None, confirm_timeout=None, **kwargs):
+        def prepare_task_publish(message,
+                                 exchange=None, routing_key=None, queue=None,
+                                 retry=None, retry_policy=None,
+                                 serializer=None, delivery_mode=None,
+                                 compression=None, declare=None,
+                                 headers=None, exchange_type=None,
+                                 timeout=None, confirm_timeout=None,
+                                 **kwargs):
             headers2, properties, body, sent_event = message
             if headers:
                 headers2.update(headers)
@@ -600,24 +659,50 @@ class AMQP:
                 if retry_policy
                 else dict(default_policy)
             )
+            return task_publish(
+                body, headers2, properties, sent_event, queue, qname,
+                exchange, routing_key, declare, retry, _rp,
+                serializer or default_serializer,
+                compression or default_compressor,
+                delivery_mode, timeout, confirm_timeout,
+            )
+        return prepare_task_publish
+
+    def _create_task_sender(self):
+        default_policy = self.app.conf.task_publish_retry_policy
+        prepare_task_publish = self._create_task_publish_preparer()
+        send_before_publish = signals.before_task_publish.send
+        send_after_publish = signals.after_task_publish.send
+
+        default_evd = self._event_dispatcher
+
+        def send_task_message(producer, name, message,
+                              exchange=None, routing_key=None, queue=None,
+                              event_dispatcher=None,
+                              retry=None, retry_policy=None,
+                              serializer=None, delivery_mode=None,
+                              compression=None, declare=None,
+                              headers=None, exchange_type=None,
+                              timeout=None, confirm_timeout=None, **kwargs):
+            publish = prepare_task_publish(
+                message, exchange=exchange, routing_key=routing_key,
+                queue=queue, retry=retry, retry_policy=retry_policy,
+                serializer=serializer, delivery_mode=delivery_mode,
+                compression=compression, declare=declare, headers=headers,
+                exchange_type=exchange_type, timeout=timeout,
+                confirm_timeout=confirm_timeout, **kwargs
+            )
+            body, headers2 = publish.body, publish.headers
+            exchange, routing_key = publish.exchange, publish.routing_key
+            retry, _rp = publish.retry, publish.retry_policy
 
             send_before_publish(
                 sender=name, body=body,
                 exchange=exchange, routing_key=routing_key,
-                declare=declare, headers=headers2,
-                properties=properties, retry_policy=_rp,
+                declare=publish.declare, headers=headers2,
+                properties=publish.properties, retry_policy=_rp,
             )
-            publish_kwargs = dict(
-                exchange=exchange,
-                routing_key=routing_key,
-                serializer=serializer or default_serializer,
-                compression=compression or default_compressor,
-                retry=retry, retry_policy=_rp,
-                delivery_mode=delivery_mode, declare=declare,
-                headers=headers2,
-                timeout=timeout, confirm_timeout=confirm_timeout,
-                **properties
-            )
+            publish_kwargs = task_publish_kwargs(publish)
             if retry and _callback_publish_retry.get():
                 # The parent task already ran, so retry only this message,
                 # waiting as the policy says and reconnecting when needed.
@@ -663,29 +748,10 @@ class AMQP:
                 sender=name, body=body, headers=headers2,
                 exchange=exchange, routing_key=routing_key,
             )
-            if sent_receivers:  # XXX deprecated
-                if isinstance(body, tuple):  # protocol version 2
-                    send_task_sent(
-                        sender=name, task_id=headers2['id'], task=name,
-                        args=body[0], kwargs=body[1],
-                        eta=headers2['eta'], taskset=headers2['group'],
-                    )
-                else:  # protocol version 1
-                    send_task_sent(
-                        sender=name, task_id=body['id'], task=name,
-                        args=body['args'], kwargs=body['kwargs'],
-                        eta=body['eta'], taskset=body['taskset'],
-                    )
+            send_task_sent_signal(name, body, headers2)
+            sent_event = task_sent_event(publish)
             if sent_event:
                 evd = event_dispatcher or default_evd
-                exname = exchange
-                if isinstance(exname, Exchange):
-                    exname = exname.name
-                sent_event.update({
-                    'queue': qname,
-                    'exchange': exname,
-                    'routing_key': routing_key,
-                })
                 evd.publish('task-sent', sent_event,
                             producer, retry=retry, retry_policy=_rp)
             return ret

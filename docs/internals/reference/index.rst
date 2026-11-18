@@ -47,6 +47,7 @@
     celery.app.trace
     celery.app.annotations
     celery.app.routes
+    celery.app.async_publish
     celery.security.certificate
     celery.security.key
     celery.security.serialization
