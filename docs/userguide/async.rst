@@ -198,6 +198,105 @@ The sync wrapper starts a new event loop for each call
 - :meth:`~@Task.apply`, :setting:`task_always_eager` and calling the task
   directly run the sync function.
 
+.. _async-asend-task:
+
+Sending tasks from an event loop
+================================
+
+:meth:`~@asend_task` is the coroutine form of :meth:`~@send_task`. It takes
+the same arguments, sends the same message and returns the same
+:class:`~celery.result.AsyncResult`:
+
+.. code-block:: python
+
+    from proj.celery import app
+
+
+    async def create_report(request):
+        result = await app.asend_task('proj.tasks.report', args=(request.user_id,))
+        return {'task_id': result.id}
+
+It can be awaited in any event loop: a web application, a script run with
+:func:`asyncio.run`, an async task of a worker with
+:option:`--aconcurrency <celery worker --aconcurrency>`. Inside a task, the
+parent and root ids of the message are set as with :meth:`~@send_task`, and
+the result is added to the task's trail unless ``add_to_parent=False``.
+
+Redis broker
+------------
+
+With a broker URL of kombu's Redis transport that names one server
+(``redis://``, ``rediss://``, ``redis+socket://``; not Sentinel and not a
+list of failover URLs), the message is pushed to Redis from the event loop
+with a ``redis.asyncio`` client:
+
+- The message is built by the code :meth:`~@send_task` uses: task options,
+  routing, the serializer and compression, priorities, and the broker
+  transport options of the Redis transport (``global_keyprefix``,
+  ``priority_steps``, ``sep``, SSL, socket timeouts,
+  ``health_check_interval``).
+- :signal:`before_task_publish` is sent before the message is built, so
+  changes a handler makes to the headers are in the message, and
+  :signal:`after_task_publish` once Redis has the message. With
+  :setting:`task_send_sent_event`, the ``task-sent`` event follows. An event
+  that cannot be published is buffered by the event dispatcher, as with
+  :meth:`~@send_task`, and the call returns.
+- Messages sent in the same iteration of the event loop go to Redis in one
+  pipeline, which is not a transaction. Each call returns or raises on its
+  own: a command that Redis rejects fails only the call it belongs to; a lost
+  connection fails every call of that pipeline.
+- A call whose publish fails with an error :meth:`kombu.Connection.ensure`
+  retries, such as a lost connection, is retried as
+  :setting:`task_publish_retry` and :setting:`task_publish_retry_policy`
+  say, or the ``retry`` and ``retry_policy`` arguments. The waits between
+  retries do not block the event loop. When the retries are exhausted, the
+  call raises :exc:`kombu.exceptions.OperationalError`, as
+  :meth:`~@send_task` does.
+- Each event loop has its own client. It is closed, with its connections,
+  when the loop cancels its remaining tasks at shutdown, as
+  :func:`asyncio.run` and :class:`asyncio.Runner` do. The client of a loop
+  closed without cancelling its tasks (:meth:`loop.close()
+  <asyncio.loop.close>` after :meth:`~asyncio.loop.run_until_complete`) stays
+  connected until the next event loop that calls :meth:`~@asend_task` creates
+  its client. A forked process sets up its own.
+
+Some steps do blocking I/O and run in a worker thread
+(:func:`asyncio.to_thread`) while the call waits:
+
+- the first call in a process, and the first after a fork, connects the
+  kombu connection that builds the messages;
+- the first message to a queue declares the queue, with a kombu connection
+  of its own: a failed declaration fails only the call it belongs to;
+- with a result backend that acts on each sent task, such as the RPC result
+  backend, which declares its reply queue, unless the call has
+  ``ignore_result=True``. The calls of one event loop iteration share one
+  thread call.
+
+The Redis result backend is not called before the publish unless
+:setting:`result_backend_thread_safe` is enabled: its instance belongs to the
+thread of the event loop, and it subscribes to the result when the result is
+waited for, reading a result stored before that.
+
+Other brokers and options
+-------------------------
+
+:meth:`~@send_task` runs in a worker thread with the same arguments:
+
+- with any other broker, RabbitMQ included;
+- with :setting:`task_always_eager`;
+- when the call passes ``producer``, ``connection`` or ``publisher``.
+
+With a Redis broker, the message is built in the event loop and published
+by the code of :meth:`~@send_task` in a worker thread when the message goes
+through an exchange (a :class:`~kombu.common.Broadcast` queue, a queue of a
+topic or fanout exchange, both the ``exchange`` and ``routing_key``
+arguments), or to a queue whose declaration is not cached
+(``auto_delete=True``, the ``x-expires`` queue argument). The same applies to
+every message when ``redis.asyncio`` does not accept a connection option of
+the broker, such as the OCSP options of :setting:`broker_use_ssl`
+(``ssl_validate_ocsp``, ``ssl_validate_ocsp_stapled``, ``ssl_ocsp_context``,
+``ssl_ocsp_expected_cert``).
+
 .. _async-starting:
 
 Starting the worker
